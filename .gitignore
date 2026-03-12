@@ -1,6 +1,8 @@
 # Local environment / secrets
 .env
 .env.*
+TODO.md
+article_draft.tex
 
 # Python cache
 __pycache__/
