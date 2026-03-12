@@ -1,0 +1,20 @@
+# ignore all .pngs
+*.png
+weights/*
+
+# Pycache
+**__pycache__**
+results*/
+*.pt
+yolov7
+weights
+datasets
+
+# Core dumps
+core
+core.*
+
+# Output videos and large files
+outputs/
+*.mp4
+*.avi
