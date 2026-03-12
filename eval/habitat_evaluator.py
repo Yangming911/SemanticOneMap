@@ -265,10 +265,10 @@ class HabitatEvaluator:
 
         # Overall results
         overall_percentages = calculate_percentages(data)
-        overall_row = pd.DataFrame([{'Object': 'Overall'} | overall_percentages.to_dict()])
+        overall_row = pd.DataFrame([{**{'Object': 'Overall'}, **overall_percentages.to_dict()}])
         object_results = pd.concat([overall_row, object_results], ignore_index=True)
 
-        overall_row = pd.DataFrame([{'Scene': 'Overall'} | overall_percentages.to_dict()])
+        overall_row = pd.DataFrame([{**{'Scene': 'Overall'}, **overall_percentages.to_dict()}])
         scene_results = pd.concat([overall_row, scene_results], ignore_index=True)
 
         # Sorting
