@@ -1,20 +1,23 @@
-# ignore all .pngs
-*.png
-weights/*
+# Local environment / secrets
+.env
+.env.*
 
-# Pycache
-**__pycache__**
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Generated outputs
+results/
 results*/
+outputs/
+
+# Large local assets / external dependencies
+datasets/
+weights/
+yolov7/
 *.pt
-yolov7
-weights
-datasets
 
 # Core dumps
 core
 core.*
-
-# Output videos and large files
-outputs/
-*.mp4
-*.avi
