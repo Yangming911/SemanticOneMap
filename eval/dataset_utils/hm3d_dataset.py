@@ -43,21 +43,34 @@ def load_hm3d_episodes(episodes: List[Episode], scene_data: Dict[str, SceneData]
 def load_hm3d_objects(scene_data: Dict[str, SceneData], semantic_objects, scene_id: str):
     for scene_obj in semantic_objects:
         obj_name = scene_obj.category.name()
-        for cat in scene_data[scene_id].object_locations.keys():
+        if not obj_name:
+            continue
+        added_to_any = False
+        for cat in list(scene_data[scene_id].object_locations.keys()):
             if scene_obj.id in scene_data[scene_id].object_locations[cat]:
+                added_to_any = True
                 continue
-            if scene_obj.semantic_id in scene_data[scene_id].object_ids[cat]:
+            if scene_obj.semantic_id in scene_data[scene_id].object_ids.get(cat, []):
                 scene_data[scene_id].object_locations[cat].append(
                     SemanticObject(scene_obj.id, obj_name, scene_obj.aabb, scene_obj.semantic_id))
+                added_to_any = True
             elif obj_name in cat or cat in obj_name:
                 scene_data[scene_id].object_locations[cat].append(
                     SemanticObject(scene_obj.id, obj_name, scene_obj.aabb, scene_obj.semantic_id))
+                added_to_any = True
             elif cat == "plant" and ("flower" in obj_name):
                 scene_data[scene_id].object_locations[cat].append(
                     SemanticObject(scene_obj.id, obj_name, scene_obj.aabb, scene_obj.semantic_id))
+                added_to_any = True
             elif cat == "sofa" and ("couch" in obj_name):
                 scene_data[scene_id].object_locations[cat].append(
                     SemanticObject(scene_obj.id, obj_name, scene_obj.aabb, scene_obj.semantic_id))
+                added_to_any = True
+        if not added_to_any:
+            if obj_name not in scene_data[scene_id].object_locations:
+                scene_data[scene_id].object_locations[obj_name] = []
+            scene_data[scene_id].object_locations[obj_name].append(
+                SemanticObject(scene_obj.id, obj_name, scene_obj.aabb, scene_obj.semantic_id))
     return scene_data
 
 

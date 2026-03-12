@@ -2,6 +2,7 @@
 from eval import get_closest_dist, FMMPlanner
 from eval.actor import Actor
 from eval.dataset_utils.gibson_dataset import load_gibson_episodes
+from eval.semantic_collision import build_semantic_collision_data, metric_to_px
 from mapping import rerun_logger
 from config import EvalConf
 from onemap_utils import monochannel_to_inferno_rgb
@@ -62,6 +63,7 @@ class Result(enum.Enum):
     FAILURE_OOT = 4
     FAILURE_NOT_REACHED = 5
     FAILURE_ALL_EXPLORED = 6
+    SEMANTIC_COLLISION = 7
 
 class HabitatEvaluator:
     def __init__(self,
@@ -118,6 +120,7 @@ class HabitatEvaluator:
         if self.actor is not None:
             self.logger = rerun_logger.RerunLogger(self.actor.mapper, False, "") if self.log_rerun else None
         self.results_path = "/home/finn/active/MON/results_gibson" if self.is_gibson else "results/"
+        self.semantic_collision_cache = {}
 
     def load_scene(self, scene_id: str):
         if self.sim is not None:
@@ -158,6 +161,31 @@ class HabitatEvaluator:
             self.scene_data = HM3DDataset.load_hm3d_objects(self.scene_data, self.sim.semantic_scene.objects, scene_id)
         else:
             self.scene_data = GibsonDataset.load_gibson_objects(self.scene_data, self.dataset_info, scene_id)
+
+    def get_semantic_collision_data(self, scene_id: str, query_label: str):
+        cache_key = (scene_id, query_label)
+        if cache_key not in self.semantic_collision_cache:
+            cell_size = self.mapping.size / self.mapping.n_points
+            max_query_radius_cells = int(self.planner.max_detect_distance / cell_size)
+            self.semantic_collision_cache[cache_key] = build_semantic_collision_data(
+                self.scene_data[scene_id].object_locations,
+                self.mapping.n_points,
+                self.mapping.size,
+                self.is_gibson,
+                query_label,
+                max_query_radius_cells,
+            )
+        return self.semantic_collision_cache[cache_key]
+
+    def check_semantic_collision(self, scene_id: str, query_label: str) -> bool:
+        collision_data = self.get_semantic_collision_data(scene_id, query_label)
+        position = self.sim.get_agent(0).get_state().position
+        x = -position[2]
+        y = -position[0]
+        px, py = metric_to_px(x, y, self.mapping.n_points, self.mapping.size / self.mapping.n_points)
+        if 0 <= px < self.mapping.n_points and 0 <= py < self.mapping.n_points:
+            return bool(collision_data.collision_map[px, py])
+        return False
 
 
 
@@ -322,6 +350,7 @@ class HabitatEvaluator:
             else:
                 obj_count[current_obj] += 1
             self.actor.set_query(current_obj)
+            self.get_semantic_collision_data(episode.scene_id, current_obj)
             if self.log_rerun:
                 pts = []
                 for obj in self.scene_data[episode.scene_id].object_locations[current_obj]:
@@ -367,6 +396,11 @@ class HabitatEvaluator:
                 self.execute_action(action)
                 if self.log_rerun:
                     self.logger.log_map()
+
+                if self.check_semantic_collision(episode.scene_id, current_obj):
+                    results[n_ep] = Result.SEMANTIC_COLLISION
+                    print("Semantic collision detected!")
+                    break
 
                 if called_found:
                     # We will now compute the closest distance to the bounding box of the object
@@ -421,7 +455,7 @@ class HabitatEvaluator:
             for obj in success_per_obj.keys():
                 print(f"{obj}: {success_per_obj[obj] / obj_count[obj]}")
             print(
-                f"Result distribution: successes: {results.count(Result.SUCCESS)}, misdetects: {results.count(Result.FAILURE_MISDETECT)}, OOT: {results.count(Result.FAILURE_OOT)}, stuck: {results.count(Result.FAILURE_STUCK)}, not reached: {results.count(Result.FAILURE_NOT_REACHED)}, all explored: {results.count(Result.FAILURE_ALL_EXPLORED)}")
+                f"Result distribution: successes: {results.count(Result.SUCCESS)}, misdetects: {results.count(Result.FAILURE_MISDETECT)}, OOT: {results.count(Result.FAILURE_OOT)}, stuck: {results.count(Result.FAILURE_STUCK)}, not reached: {results.count(Result.FAILURE_NOT_REACHED)}, all explored: {results.count(Result.FAILURE_ALL_EXPLORED)}, semantic collisions: {results.count(Result.SEMANTIC_COLLISION)}")
             # Write result to file
             with open(f"{self.results_path}/state/state_{episode.episode_id}.txt", 'w') as f:
                 f.write(str(results[n_ep].value))

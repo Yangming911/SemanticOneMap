@@ -74,7 +74,8 @@ def load_states(state_dir):
     """Return dict {episode_id: state_value}."""
     # Result codes from habitat_evaluator.py
     result_names = {1: "SUCCESS", 2: "FAILURE_MISDETECT", 3: "FAILURE_STUCK",
-                    4: "FAILURE_OOT", 5: "FAILURE_NOT_REACHED", 6: "FAILURE_ALL_EXPLORED"}
+                    4: "FAILURE_OOT", 5: "FAILURE_NOT_REACHED", 6: "FAILURE_ALL_EXPLORED",
+                    7: "SEMANTIC_COLLISION"}
     states = {}
     if not os.path.isdir(state_dir):
         return states, result_names
