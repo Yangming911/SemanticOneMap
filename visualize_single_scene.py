@@ -514,13 +514,18 @@ def main() -> None:
                 ],
             )
             obstacle_panel = build_obstacle_panel(evaluator.actor.mapper)
+            obstacle_title = (
+                "Semantic-Inflated Navigable Map + A*"
+                if getattr(evaluator.actor.mapper, "use_clip_semantic_nav_map", False)
+                else "Dilated Obstacles + A*"
+            )
             obstacle_panel = draw_path_robot_goal(
                 obstacle_panel,
                 evaluator.actor.mapper,
                 robot_px,
                 path,
                 chosen_detection,
-                "Semantic-Inflated Navigable Map + A*",
+                obstacle_title,
             )
             semantic_panel = build_semantic_panel(
                 evaluator.actor.mapper,

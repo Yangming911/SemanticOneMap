@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from eval.semantic_collision import get_semantic_safety_radius_cells, normalize_semantic_label
+from eval.semantic_collision import get_semantic_safety_radius_cells, normalize_semantic_label, _NON_OBSTACLE_LABELS
 
 
 @dataclass
@@ -27,15 +27,19 @@ def build_semantic_label_config(raw_labels: List[str]) -> SemanticLabelConfig:
             continue
         label_to_idx[label] = len(labels)
         labels.append(label)
-        radius = get_semantic_safety_radius_cells(
-            label=label,
-            query_label="__query__",
-            max_query_radius_cells=None,
-        )
-        radii.append(max(int(radius), 0))
+        if label in _NON_OBSTACLE_LABELS:
+            radii.append(-1)  # sentinel: not an obstacle, skip blocking
+        else:
+            radius = get_semantic_safety_radius_cells(
+                label=label,
+                query_label="__query__",
+                max_query_radius_cells=None,
+            )
+            radii.append(max(int(radius), 0))
 
     radii_arr = np.asarray(radii, dtype=np.int32) if radii else np.zeros((0,), dtype=np.int32)
-    max_radius = int(radii_arr.max()) if radii_arr.size > 0 else 0
+    positive_radii = radii_arr[radii_arr >= 0]
+    max_radius = int(positive_radii.max()) if positive_radii.size > 0 else 0
     return SemanticLabelConfig(labels=labels, radii=radii_arr, max_radius=max_radius)
 
 
@@ -45,7 +49,10 @@ class SemanticNavigableMapUpdater:
         self.labels = label_config.labels
         self.radii = label_config.radii
         self.max_radius = label_config.max_radius
-        self._kernels = [self._make_disk_kernel(int(radius)) for radius in self.radii.tolist()]
+        self._kernels = [
+            self._make_disk_kernel(int(r)) if r >= 0 else None
+            for r in self.radii.tolist()
+        ]
         self.seed_label_map = np.zeros((n_cells, n_cells), dtype=np.uint16)
         self.semantic_blocked_map = np.zeros((n_cells, n_cells), dtype=bool)
         self.semantic_navigable_map = np.ones((n_cells, n_cells), dtype=bool)
@@ -131,6 +138,8 @@ class SemanticNavigableMapUpdater:
         local_blocked = np.zeros((source_h, source_w), dtype=bool)
 
         for label_idx, kernel in enumerate(self._kernels, start=1):
+            if kernel is None:
+                continue
             class_seed = (source_seed == label_idx).astype(np.uint8)
             if class_seed.max() == 0:
                 continue

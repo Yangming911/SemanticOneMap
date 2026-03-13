@@ -15,4 +15,4 @@ MappingConf: # [all in feature_map.py]
   filter_stairs: True
   floor_level: -0.88
   floor_threshold: -1.1
-  use_clip_semantic_nav_map: False  # False keeps pre-TODO navigable-map behavior
+  use_clip_semantic_nav_map: True

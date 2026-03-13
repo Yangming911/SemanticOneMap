@@ -12,6 +12,7 @@ from mapping import (OneMap, detect_frontiers, get_frontier_midpoint,
 from planning import Planning
 from vision_models.base_model import BaseModel
 from vision_models.coco_classes import COCO_CLASSES
+from eval.semantic_collision import _NON_OBSTACLE_LABELS
 from vision_models.yolo_world_detector import YOLOWorldDetector
 from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 from config import Conf, load_config
@@ -151,7 +152,7 @@ class Navigator:
         self.semantic_text_features = None
         self.semantic_map_updater = None
         if self.use_clip_semantic_nav_map:
-            self.semantic_label_config = build_semantic_label_config(list(COCO_CLASSES))
+            self.semantic_label_config = build_semantic_label_config(list(COCO_CLASSES) + list(_NON_OBSTACLE_LABELS))
             self.semantic_text_features = self.model.get_text_features(
                 [f"a {label}" for label in self.semantic_label_config.labels]
             ).to(self.one_map.map_device)
