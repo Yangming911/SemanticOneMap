@@ -35,6 +35,7 @@ import quaternion
 # typing
 from typing import Tuple, List, Dict
 import enum
+import time
 
 # habitat
 import habitat_sim
@@ -321,6 +322,7 @@ class HabitatEvaluator:
         return data
 
     def evaluate(self):
+        eval_start = time.time()
         success = 0
         n_eps = 0
         # randomly shuffle episodes
@@ -328,6 +330,8 @@ class HabitatEvaluator:
         success_per_obj = {}
         obj_count = {}
         results = []
+        spl_accum = 0.0
+        path_lengths = {}
         # restart at 930
         for n_ep, episode in enumerate(self.episodes):
             poses = []
@@ -440,6 +444,13 @@ class HabitatEvaluator:
             if results[n_ep] == Result.FAILURE_OOT and np.linalg.norm(poses[-1] - poses[-10]) < 0.05:
                 results[n_ep] = Result.FAILURE_STUCK
 
+            # Path length (xy plane) and SPL
+            path_len = float(np.sum(np.linalg.norm(np.diff(poses[:, :2], axis=0), axis=1))) if len(poses) > 1 else 0.0
+            path_lengths[episode.episode_id] = path_len
+            geo_dist = episode.best_dist if isinstance(episode.best_dist, float) else float(episode.best_dist)
+            is_success = results[n_ep] == Result.SUCCESS
+            spl_accum += is_success * geo_dist / max(path_len, geo_dist) if geo_dist > 0 else 0.0
+
             num_frontiers = len(self.actor.mapper.nav_goals)
             np.savetxt(f"{self.results_path}/trajectories/poses_{episode.episode_id}.csv", poses, delimiter=",")
             # save final sim to image file
@@ -459,3 +470,18 @@ class HabitatEvaluator:
             # Write result to file
             with open(f"{self.results_path}/state/state_{episode.episode_id}.txt", 'w') as f:
                 f.write(str(results[n_ep].value))
+
+        total_time = time.time() - eval_start
+        sr = success / n_eps if n_eps > 0 else 0.0
+        spl = spl_accum / n_eps if n_eps > 0 else 0.0
+        result_counts = {r: results.count(r) for r in Result}
+        step_times = getattr(self.actor, "step_times_ms", [])
+        return {
+            "n_eps": n_eps,
+            "total_time_s": total_time,
+            "sr": sr,
+            "spl": spl,
+            "result_counts": result_counts,
+            "avg_step_time_ms": float(np.mean(step_times)) if step_times else None,
+            "path_lengths": path_lengths,
+        }

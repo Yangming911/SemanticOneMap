@@ -1,7 +1,8 @@
 # abstract classes
 from abc import ABC, abstractmethod
 
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
+import time
 
 import numpy as np
 
@@ -50,6 +51,7 @@ class MONActor(Actor):
             # self.policy = WrappedPointNavResNetPolicy("/home/finn/External/vlfm/pointnav.pth", "/home/finn/External/vlfm/pointnav_conf.pth", "cuda")
 
         self.mapper = Navigator(model, detector, config)
+        self.step_times_ms: List[float] = []
 
         self.init = 36*2
         hfov = 90 if self.square else 97
@@ -68,6 +70,12 @@ class MONActor(Actor):
         self.controller = Controllers.HabitatController(None, config.controller)
 
     def act(self, observations: Dict[str, any]) -> Tuple[Dict, bool]:
+        _t0 = time.perf_counter()
+        result = self._act(observations)
+        self.step_times_ms.append((time.perf_counter() - _t0) * 1000.0)
+        return result
+
+    def _act(self, observations: Dict[str, any]) -> Tuple[Dict, bool]:
         return_act = {}
         state = observations["state"]
         pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
