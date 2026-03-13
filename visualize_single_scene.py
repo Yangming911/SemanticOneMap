@@ -248,7 +248,8 @@ def build_ground_truth_semantic_panel(evaluator: HabitatEvaluator, scene_id: str
 
 
 def build_obstacle_panel(mapper) -> np.ndarray:
-    dilated_obstacles = (~mapper.one_map.navigable_map.astype(bool)).astype(np.uint8)
+    navigable_map = mapper.get_active_navigable_map() if hasattr(mapper, "get_active_navigable_map") else mapper.one_map.navigable_map
+    dilated_obstacles = (~navigable_map.astype(bool)).astype(np.uint8)
     panel = np.zeros((dilated_obstacles.shape[0], dilated_obstacles.shape[1], 3), dtype=np.uint8)
     panel[dilated_obstacles > 0] = np.array([230, 230, 230], dtype=np.uint8)
     panel = orient_xy_map(panel)
@@ -264,7 +265,8 @@ def draw_path_robot_goal(
     title: str,
 ) -> np.ndarray:
     canvas = panel.copy()
-    map_shape = mapper.one_map.navigable_map.shape
+    navigable_map = mapper.get_active_navigable_map() if hasattr(mapper, "get_active_navigable_map") else mapper.one_map.navigable_map
+    map_shape = navigable_map.shape
 
     if isinstance(path, list) and len(path) > 1:
         path_pts = path_to_display(path, map_shape, PANEL_SIZE)
@@ -518,7 +520,7 @@ def main() -> None:
                 robot_px,
                 path,
                 chosen_detection,
-                "Dilated Obstacles + A*",
+                "Semantic-Inflated Navigable Map + A*",
             )
             semantic_panel = build_semantic_panel(
                 evaluator.actor.mapper,

@@ -22,4 +22,5 @@ class MappingConf:
     filter_stairs: bool
     floor_level: float
     floor_threshold: float
+    use_clip_semantic_nav_map: bool
 

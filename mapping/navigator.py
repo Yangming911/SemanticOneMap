@@ -11,11 +11,13 @@ from mapping import (OneMap, detect_frontiers, get_frontier_midpoint,
 
 from planning import Planning
 from vision_models.base_model import BaseModel
+from vision_models.coco_classes import COCO_CLASSES
 from vision_models.yolo_world_detector import YOLOWorldDetector
 from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 from config import Conf, load_config
 from config import SpotControllerConf
 from mobile_sam import sam_model_registry, SamPredictor
+from mapping.semantic_navigable_map import SemanticNavigableMapUpdater, build_semantic_label_config
 
 # numpy
 import numpy as np
@@ -144,6 +146,18 @@ class Navigator:
         self.sam_predictor = SamPredictor(self.sam)
 
         self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
+        self.use_clip_semantic_nav_map = bool(getattr(config.mapping, "use_clip_semantic_nav_map", False))
+        self.semantic_label_config = None
+        self.semantic_text_features = None
+        self.semantic_map_updater = None
+        if self.use_clip_semantic_nav_map:
+            self.semantic_label_config = build_semantic_label_config(list(COCO_CLASSES))
+            self.semantic_text_features = self.model.get_text_features(
+                [f"a {label}" for label in self.semantic_label_config.labels]
+            ).to(self.one_map.map_device)
+            self.semantic_map_updater = SemanticNavigableMapUpdater(self.one_map.n_cells, self.semantic_label_config)
+            self.semantic_map_updater.reset(self.one_map.navigable_map)
+        self.semantic_navigable_map = self.one_map.navigable_map.copy()
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
@@ -165,7 +179,7 @@ class Navigator:
         self.object_detected = False
         self.chosen_detection = None
         self.is_goal_path = False
-        self.navigation_scores = np.zeros_like(self.one_map.navigable_map, dtype=np.float32)
+        self.navigation_scores = np.zeros_like(self.semantic_navigable_map, dtype=np.float32)
         self.path = None
         self.is_spot = type(config.controller) == SpotControllerConf
         self.initializing = True
@@ -212,11 +226,14 @@ class Navigator:
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
         self.is_goal_path = False
-        self.navigation_scores = np.zeros_like(self.one_map.navigable_map, dtype=np.float32)
         self.path = None
         self.path_id = 0
         self.initializing = True
         self.one_map.reset()
+        if self.use_clip_semantic_nav_map and self.semantic_map_updater is not None:
+            self.semantic_map_updater.reset(self.one_map.navigable_map)
+        self.semantic_navigable_map = self.one_map.navigable_map.copy()
+        self.navigation_scores = np.zeros_like(self.semantic_navigable_map, dtype=np.float32)
         self.first_obs = True
         self.cyclic_checker = CyclicChecker()
         self.cyclic_detect_checker = CyclicDetectChecker()
@@ -251,6 +268,51 @@ class Navigator:
             self.detector.set_classes(self.query_text)
             self.object_detected = False
             self.get_map(False)
+
+    def get_active_navigable_map(self) -> np.ndarray:
+        if self.use_clip_semantic_nav_map and self.semantic_navigable_map is not None:
+            return self.semantic_navigable_map
+        return self.one_map.navigable_map
+
+    @torch.no_grad()
+    def _update_semantic_navigable_map(self) -> None:
+        if not self.use_clip_semantic_nav_map:
+            self.semantic_navigable_map = self.one_map.navigable_map.copy()
+            return
+
+        if self.semantic_map_updater is None or self.semantic_text_features is None:
+            self.semantic_navigable_map = self.one_map.navigable_map.copy()
+            return
+
+        updated_all = self.one_map.updated_mask
+        if updated_all.max() == 0:
+            self.semantic_navigable_map = self.semantic_map_updater.update(
+                self.one_map.navigable_map,
+                np.zeros_like(self.one_map.navigable_map, dtype=bool),
+                self.semantic_map_updater.seed_label_map,
+            )
+            return
+
+        changed_mask = updated_all.detach().cpu().numpy().astype(bool)
+        label_ids_map = self.semantic_map_updater.seed_label_map.copy()
+        label_ids_map[changed_mask] = 0
+
+        valid_updated = updated_all & (self.one_map.confidence_map > 0)
+        if valid_updated.max() > 0:
+            feats = self.one_map.feature_map[valid_updated, :]
+            text_features = self.semantic_text_features.to(feats.device)
+            if text_features.dtype != feats.dtype:
+                text_features = text_features.to(feats.dtype)
+            sims = feats @ text_features.T
+            pred_ids = (torch.argmax(sims, dim=1) + 1).detach().cpu().numpy().astype(np.uint16)
+            valid_mask_np = valid_updated.detach().cpu().numpy().astype(bool)
+            label_ids_map[valid_mask_np] = pred_ids
+
+        self.semantic_navigable_map = self.semantic_map_updater.update(
+            self.one_map.navigable_map,
+            changed_mask,
+            label_ids_map,
+        )
 
     def get_path(self
                  ) -> Union[np.ndarray, str]:
@@ -325,14 +387,14 @@ class Navigator:
                 self.cyclic_checker.add_state_action(start, best_nav_goal.get_descr_point(), top_two_vals)
                 if isinstance(best_nav_goal, Frontier):
                     # NOTE Allow more aggressive planning through unknown regions
-                    self.path = Planning.compute_to_goal(start, self.one_map.navigable_map, # & (
+                    self.path = Planning.compute_to_goal(start, self.get_active_navigable_map(), # & (
                             #self.one_map.confidence_map > 0).cpu().numpy(),
                                                          (self.one_map.confidence_map > 0).cpu().numpy(),
                                                          best_nav_goal.get_descr_point(),
                                                          self.obstcl_kernel_size, 2)
                 elif isinstance(best_nav_goal, Cluster):
                     # NOTE Allow more aggressive planning through unknown regions
-                    self.path = Planning.compute_to_goal(start, self.one_map.navigable_map,# & (
+                    self.path = Planning.compute_to_goal(start, self.get_active_navigable_map(),# & (
                             # self.one_map.confidence_map > 0).cpu().numpy(),
                                                          (self.one_map.confidence_map > 0).cpu().numpy(),
                                                          best_nav_goal.get_descr_point(),
@@ -373,7 +435,7 @@ class Navigator:
                 self.path = [start] * 5
                 # We are close to the object, we don't need to move
                 return
-            self.path = Planning.compute_to_goal(start, self.one_map.navigable_map,
+            self.path = Planning.compute_to_goal(start, self.get_active_navigable_map(),
                                                  (self.one_map.confidence_map > 0).cpu().numpy(),
                                                  self.chosen_detection,
                                                  self.obstcl_kernel_size, self.min_goal_dist)
@@ -399,7 +461,7 @@ class Navigator:
         if self.previous_sims is not None:
             # Compute the frontiers
             frontiers, unexplored_map, largest_contour = detect_frontiers(
-                self.one_map.navigable_map.astype(np.uint8),
+                self.get_active_navigable_map().astype(np.uint8),
                 self.one_map.fully_explored_map.astype(np.uint8),
                 self.one_map.confidence_map > 0,
                 int(1.0 * ((
@@ -522,6 +584,7 @@ class Navigator:
         image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
         b = time.time()
         self.one_map.update(image_features, depth, odometry, self.artificial_obstacles)
+        self._update_semantic_navigable_map()
         c = time.time()
         self.get_map(False)
         d = time.time()
