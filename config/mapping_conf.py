@@ -23,4 +23,5 @@ class MappingConf:
     floor_level: float
     floor_threshold: float
     use_clip_semantic_nav_map: bool
+    clip_semantic_sim_threshold: float
 

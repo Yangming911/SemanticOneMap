@@ -44,6 +44,7 @@ def write_eval_log(summary: dict, cfg):
         f"  Max dist (success): {ec.max_dist} m",
         f"  Map size          : {mc.n_points}x{mc.n_points} cells, {mc.size} m",
         f"  Obstacle kernel   : {pc.obstcl_kernel_size} m",
+        f"  CLIP semantic map : {getattr(mc, 'use_clip_semantic_nav_map', False)}  (sim_threshold={getattr(mc, 'clip_semantic_sim_threshold', 0.0)})",
         f"  YOLO confidence   : {pc.yolo_confidence}",
         f"  Consensus filter  : {pc.consensus_filtering}",
         f"  Using frontiers   : {pc.use_frontiers}",

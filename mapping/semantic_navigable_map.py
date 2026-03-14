@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from eval.semantic_collision import get_semantic_safety_radius_cells, normalize_semantic_label, _NON_OBSTACLE_LABELS
+from eval.semantic_collision import get_semantic_safety_radius_cells, normalize_semantic_label, _NON_OBSTACLE_LABELS, _SEMANTIC_SAFETY_RADIUS_CELLS
 
 
 @dataclass
@@ -27,15 +27,10 @@ def build_semantic_label_config(raw_labels: List[str]) -> SemanticLabelConfig:
             continue
         label_to_idx[label] = len(labels)
         labels.append(label)
-        if label in _NON_OBSTACLE_LABELS:
-            radii.append(-1)  # sentinel: not an obstacle, skip blocking
+        if label in _SEMANTIC_SAFETY_RADIUS_CELLS:
+            radii.append(int(_SEMANTIC_SAFETY_RADIUS_CELLS[label]))
         else:
-            radius = get_semantic_safety_radius_cells(
-                label=label,
-                query_label="__query__",
-                max_query_radius_cells=None,
-            )
-            radii.append(max(int(radius), 0))
+            radii.append(-1)  # not in obstacle whitelist → treat as free space
 
     radii_arr = np.asarray(radii, dtype=np.int32) if radii else np.zeros((0,), dtype=np.int32)
     positive_radii = radii_arr[radii_arr >= 0]

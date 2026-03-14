@@ -88,7 +88,9 @@ def get_semantic_safety_radius_cells(
     normalized_query = normalize_semantic_label(query_label)
     if normalized_label == normalized_query:
         return 0
-    radius = _SEMANTIC_SAFETY_RADIUS_CELLS.get(normalized_label, _DEFAULT_SAFETY_RADIUS_CELLS)
+    radius = _SEMANTIC_SAFETY_RADIUS_CELLS.get(normalized_label)
+    if radius is None:
+        return -1  # not in obstacle whitelist → treat as free space
     return max(int(radius), 0)
 
 
@@ -122,7 +124,7 @@ def _build_label_seed_map(
 
     for raw_label, objects in object_locations.items():
         label = normalize_semantic_label(raw_label)
-        if label in _NON_OBSTACLE_LABELS:
+        if label not in _SEMANTIC_SAFETY_RADIUS_CELLS:
             continue
         if label not in label_to_idx:
             label_to_idx[label] = len(labels) + 1

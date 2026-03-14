@@ -2,7 +2,8 @@
 from eval import get_closest_dist, FMMPlanner
 from eval.actor import Actor
 from eval.dataset_utils.gibson_dataset import load_gibson_episodes
-from eval.semantic_collision import build_semantic_collision_data, metric_to_px
+from eval.semantic_collision import build_semantic_collision_data, metric_to_px, _build_label_seed_map
+from mapping.semantic_debug import SemanticPredGTCollector
 from mapping import rerun_logger
 from config import EvalConf
 from onemap_utils import monochannel_to_inferno_rgb
@@ -122,6 +123,9 @@ class HabitatEvaluator:
             self.logger = rerun_logger.RerunLogger(self.actor.mapper, False, "") if self.log_rerun else None
         self.results_path = "/home/finn/active/MON/results_gibson" if self.is_gibson else "results/"
         self.semantic_collision_cache = {}
+        self.debug_collector = SemanticPredGTCollector()
+        if self.actor is not None:
+            self.actor.mapper.debug_collector = self.debug_collector
 
     def load_scene(self, scene_id: str):
         if self.sim is not None:
@@ -156,12 +160,16 @@ class HabitatEvaluator:
         agent_cfg.sensor_specifications = [rgb, depth]
         sim_cfg = habitat_sim.Configuration(backend_cfg, [agent_cfg])
         self.sim = habitat_sim.Simulator(sim_cfg)
-        if self.scene_data[scene_id].objects_loaded:
-            return
-        if not self.is_gibson:
-            self.scene_data = HM3DDataset.load_hm3d_objects(self.scene_data, self.sim.semantic_scene.objects, scene_id)
-        else:
-            self.scene_data = GibsonDataset.load_gibson_objects(self.scene_data, self.dataset_info, scene_id)
+        if not self.scene_data[scene_id].objects_loaded:
+            if not self.is_gibson:
+                self.scene_data = HM3DDataset.load_hm3d_objects(self.scene_data, self.sim.semantic_scene.objects, scene_id)
+            else:
+                self.scene_data = GibsonDataset.load_gibson_objects(self.scene_data, self.dataset_info, scene_id)
+        cell_size = self.mapping.size / self.mapping.n_points
+        gt_seed_map, gt_labels = _build_label_seed_map(
+            self.scene_data[scene_id].object_locations, self.mapping.n_points, cell_size, self.is_gibson
+        )
+        self.debug_collector.set_gt_map(gt_seed_map, gt_labels)
 
     def get_semantic_collision_data(self, scene_id: str, query_label: str):
         cache_key = (scene_id, query_label)
@@ -472,6 +480,10 @@ class HabitatEvaluator:
                 f.write(str(results[n_ep].value))
 
         total_time = time.time() - eval_start
+        from datetime import datetime
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.debug_collector.save_csv(f"{self.results_path}/semantic_pred_gt_pairs_{_ts}.csv")
+        self.debug_collector.save_sim_distribution_csv(f"{self.results_path}/semantic_sim_distribution_{_ts}.csv")
         sr = success / n_eps if n_eps > 0 else 0.0
         spl = spl_accum / n_eps if n_eps > 0 else 0.0
         result_counts = {r: results.count(r) for r in Result}

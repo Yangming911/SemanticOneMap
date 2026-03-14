@@ -19,6 +19,7 @@ from config import Conf, load_config
 from config import SpotControllerConf
 from mobile_sam import sam_model_registry, SamPredictor
 from mapping.semantic_navigable_map import SemanticNavigableMapUpdater, build_semantic_label_config
+from mapping.semantic_debug import SemanticPredGTCollector
 
 # numpy
 import numpy as np
@@ -148,6 +149,7 @@ class Navigator:
 
         self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
         self.use_clip_semantic_nav_map = bool(getattr(config.mapping, "use_clip_semantic_nav_map", False))
+        self.clip_semantic_sim_threshold = float(getattr(config.mapping, "clip_semantic_sim_threshold", 0.0))
         self.semantic_label_config = None
         self.semantic_text_features = None
         self.semantic_map_updater = None
@@ -159,6 +161,7 @@ class Navigator:
             self.semantic_map_updater = SemanticNavigableMapUpdater(self.one_map.n_cells, self.semantic_label_config)
             self.semantic_map_updater.reset(self.one_map.navigable_map)
         self.semantic_navigable_map = self.one_map.navigable_map.copy()
+        self.debug_collector: SemanticPredGTCollector = None
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
@@ -305,9 +308,16 @@ class Navigator:
             if text_features.dtype != feats.dtype:
                 text_features = text_features.to(feats.dtype)
             sims = feats @ text_features.T
-            pred_ids = (torch.argmax(sims, dim=1) + 1).detach().cpu().numpy().astype(np.uint16)
+            max_sims, argmax_ids = torch.max(sims, dim=1)
+            pred_ids = (argmax_ids + 1).detach().cpu().numpy().astype(np.uint16)
+            if self.clip_semantic_sim_threshold > 0.0:
+                below_thresh = (max_sims < self.clip_semantic_sim_threshold).detach().cpu().numpy()
+                pred_ids[below_thresh] = 0  # 0 = no label → not blocked
             valid_mask_np = valid_updated.detach().cpu().numpy().astype(bool)
             label_ids_map[valid_mask_np] = pred_ids
+            if self.debug_collector is not None:
+                max_sims_np = max_sims.detach().cpu().numpy().astype(np.float32)
+                self.debug_collector.record(valid_mask_np, pred_ids, self.semantic_label_config.labels, max_sims_np)
 
         self.semantic_navigable_map = self.semantic_map_updater.update(
             self.one_map.navigable_map,
