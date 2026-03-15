@@ -3,7 +3,7 @@ from eval import get_closest_dist, FMMPlanner
 from eval.actor import Actor
 from eval.dataset_utils.gibson_dataset import load_gibson_episodes
 from eval.semantic_collision import build_semantic_collision_data, metric_to_px, _build_label_seed_map
-from mapping.semantic_debug import SemanticPredGTCollector
+from mapping.semantic_debug import SemanticPredGTCollector, YOLOObstacleDebugCollector
 from mapping import rerun_logger
 from config import EvalConf
 from onemap_utils import monochannel_to_inferno_rgb
@@ -126,6 +126,11 @@ class HabitatEvaluator:
         self.debug_collector = SemanticPredGTCollector()
         if self.actor is not None:
             self.actor.mapper.debug_collector = self.debug_collector
+        self.yolo_debug_collector = YOLOObstacleDebugCollector()
+        if self.actor is not None:
+            yolo_map = getattr(self.actor.mapper, "yolo_obstacle_map", None)
+            if yolo_map is not None:
+                yolo_map.debug_collector = self.yolo_debug_collector
 
     def load_scene(self, scene_id: str):
         if self.sim is not None:
@@ -170,6 +175,7 @@ class HabitatEvaluator:
             self.scene_data[scene_id].object_locations, self.mapping.n_points, cell_size, self.is_gibson
         )
         self.debug_collector.set_gt_map(gt_seed_map, gt_labels)
+        self.yolo_debug_collector.set_gt_map(gt_seed_map, gt_labels)
 
     def get_semantic_collision_data(self, scene_id: str, query_label: str):
         cache_key = (scene_id, query_label)
@@ -484,6 +490,7 @@ class HabitatEvaluator:
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.debug_collector.save_csv(f"{self.results_path}/semantic_pred_gt_pairs_{_ts}.csv")
         self.debug_collector.save_sim_distribution_csv(f"{self.results_path}/semantic_sim_distribution_{_ts}.csv")
+        self.yolo_debug_collector.save_csv(f"{self.results_path}/yolo_obstacle_pred_gt_{_ts}.csv")
         sr = success / n_eps if n_eps > 0 else 0.0
         spl = spl_accum / n_eps if n_eps > 0 else 0.0
         result_counts = {r: results.count(r) for r in Result}

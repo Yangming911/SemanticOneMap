@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from eval.habitat_evaluator import HabitatEvaluator, Result
+from eval.semantic_collision import _SEMANTIC_SAFETY_RADIUS_CELLS
 from config import load_eval_config
 from eval.actor import MONActor
 from visualize_single_scene import resolve_eval_paths
@@ -45,6 +46,9 @@ def write_eval_log(summary: dict, cfg):
         f"  Map size          : {mc.n_points}x{mc.n_points} cells, {mc.size} m",
         f"  Obstacle kernel   : {pc.obstcl_kernel_size} m",
         f"  CLIP semantic map : {getattr(mc, 'use_clip_semantic_nav_map', False)}  (sim_threshold={getattr(mc, 'clip_semantic_sim_threshold', 0.0)})",
+        f"  YOLO obstacle map : {getattr(mc, 'use_yolo_obstacle_map', False)}"
+        f"  (window={getattr(mc, 'yolo_window_size', 50)})",
+        f"  Obstacle dict     : {list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())}",
         f"  YOLO confidence   : {pc.yolo_confidence}",
         f"  Consensus filter  : {pc.consensus_filtering}",
         f"  Using frontiers   : {pc.use_frontiers}",

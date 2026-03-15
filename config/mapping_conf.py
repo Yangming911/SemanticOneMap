@@ -24,4 +24,6 @@ class MappingConf:
     floor_threshold: float
     use_clip_semantic_nav_map: bool
     clip_semantic_sim_threshold: float
+    use_yolo_obstacle_map: bool
+    yolo_window_size: int
 

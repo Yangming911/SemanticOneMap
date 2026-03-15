@@ -45,6 +45,8 @@ class YOLOv7Detector:
         self.class_map["toilet"] = "toilet"
         classes_oi = ["chair", "tv", "potted plant", "bed", "toilet", "couch"]
         self.classes_oi = [COCO_CLASSES.index(c) for c in classes_oi]
+        self.classes_oi_names = classes_oi  # human-readable names for obstacle detection
+        self._last_obstacle_detections: dict = {}  # cached from last detect() call
         # self.classes_oi = None
 
     def predict(self, image):
@@ -103,17 +105,35 @@ class YOLOv7Detector:
         preds = {}
         preds["boxes"] = []
         preds["scores"] = []
+
+        # Cache all obstacle-class detections grouped by class name
+        obstacle_detections: dict = {name: [] for name in self.classes_oi_names}
+
         for i in range(pred.shape[0]):
             class_name = COCO_CLASSES[int(pred[i, 5])]
-            if class_name == self.classes[0]:
-                box = boxes[i]
-                if not (box[0].item() == box[2].item() or box[1].item() == box[3].item()):
-                    preds["boxes"].append([box[0].item(), box[1].item(), box[2].item(), box[3].item()])
-                    preds["scores"].append(logits[i])
-                    # print(logits[i])
+            box = boxes[i]
+            if box[0].item() == box[2].item() or box[1].item() == box[3].item():
+                continue
+            box_list = [box[0].item(), box[1].item(), box[2].item(), box[3].item()]
 
+            if class_name == self.classes[0]:
+                preds["boxes"].append(box_list)
+                preds["scores"].append(logits[i])
+
+            if class_name in obstacle_detections:
+                obstacle_detections[class_name].append(box_list)
+
+        self._last_obstacle_detections = obstacle_detections
         # print(f"YOLO forward: {time.time() - a}")
         return preds
+
+    def get_obstacle_detections(self) -> dict:
+        """Return cached obstacle detections from the last detect() call.
+
+        Returns:
+            dict {class_name: [[x1, y1, x2, y2], ...]} for all classes_oi.
+        """
+        return self._last_obstacle_detections
 
 if __name__ == "__main__":
     start = torch.cuda.Event(enable_timing=True)

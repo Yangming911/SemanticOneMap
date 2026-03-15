@@ -247,6 +247,37 @@ def build_ground_truth_semantic_panel(evaluator: HabitatEvaluator, scene_id: str
     return cv2.resize(oriented, (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
 
 
+def build_yolo_obstacle_panel(mapper, evaluator, scene_id: str, query_label: str) -> np.ndarray:
+    """Depth-based navigable map + YOLO semantic inflation overlay (no GT).
+
+    Layer order (bottom → top):
+      white  : navigable (neither depth nor YOLO blocked)
+      grey   : depth point-cloud obstacle (agent-radius dilated)
+      orange : YOLO seed points (raw projected bbox centres)
+      red    : YOLO semantic inflation (dilated obstacle mask)
+    """
+    n = mapper.one_map.n_cells
+    panel = np.zeros((n, n, 3), dtype=np.uint8)
+
+    # Layer 1: depth obstacles (grey, same style as other panels)
+    base_nav = mapper.one_map.navigable_map.astype(bool)
+    panel[~base_nav] = (80, 80, 80)         # depth obstacle → grey
+
+    # Layer 2: YOLO inflation on top
+    yolo_map = getattr(mapper, "yolo_obstacle_map", None)
+    if yolo_map is not None:
+        yolo_mask = yolo_map.get_obstacle_mask()
+        # Cells blocked by YOLO (on top of navigable) → red
+        yolo_only = yolo_mask & base_nav
+        panel[yolo_only] = (0, 0, 200)      # red (BGR)
+        # Raw seeds (within window) on top → orange
+        for _frame, _label, px, py in yolo_map._events:
+            panel[px, py] = (0, 140, 255)   # orange (BGR)
+
+    oriented = orient_xy_map(panel)
+    return cv2.resize(oriented, (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
+
+
 def build_obstacle_panel(mapper) -> np.ndarray:
     navigable_map = mapper.get_active_navigable_map() if hasattr(mapper, "get_active_navigable_map") else mapper.one_map.navigable_map
     dilated_obstacles = (~navigable_map.astype(bool)).astype(np.uint8)
@@ -567,7 +598,21 @@ def main() -> None:
                 max_items=15,
             )
 
-            frame = np.concatenate([rgb_panel, obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
+            if getattr(evaluator.actor.mapper, "use_yolo_obstacle_map", False):
+                yolo_panel = build_yolo_obstacle_panel(
+                    evaluator.actor.mapper, evaluator, episode.scene_id, current_obj
+                )
+                yolo_panel = draw_path_robot_goal(
+                    yolo_panel,
+                    evaluator.actor.mapper,
+                    robot_px,
+                    path,
+                    chosen_detection,
+                    "YOLO Obstacle Map (orange=seed, red=dilated, green=GT)",
+                )
+                frame = np.concatenate([rgb_panel, yolo_panel, semantic_panel, gt_semantic_panel], axis=1)
+            else:
+                frame = np.concatenate([rgb_panel, obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
 
             if writer is None:
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")

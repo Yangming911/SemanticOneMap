@@ -82,3 +82,78 @@ class SemanticPredGTCollector:
                     bin_center = round(float((_SIM_BINS[i] + _SIM_BINS[i + 1]) / 2), 4)
                     writer.writerow([gt_label, bin_labels[i], bin_center, int(count)])
         print(f"[SemanticDebug] Saved sim distribution ({len(self.sim_hist)} categories) → {path}")
+
+
+class YOLOObstacleDebugCollector:
+    """Records (YOLO-detected label, GT label at projected cell) pairs.
+
+    Two GT maps are maintained:
+      - gt_seed_map   : exact per-instance object centres (1 cell each)
+      - gt_dilated_map: each seed dilated by _DILATE_R cells — a loose
+                        neighbourhood check that tolerates bbox projection noise
+
+    We report hits against BOTH maps so we can distinguish:
+      - True localisation error (miss even the dilated zone)
+      - Quantisation / bbox-centre noise (miss exact seed but hit dilated zone)
+    """
+
+    _DILATE_R = 5   # cells (~0.5 m) used for loose GT matching
+
+    def __init__(self) -> None:
+        self.counts_exact:   Counter = Counter()   # vs exact seed map
+        self.counts_dilated: Counter = Counter()   # vs dilated zone
+        self.gt_seed_map:    Optional[np.ndarray] = None
+        self.gt_dilated_map: Optional[np.ndarray] = None
+        self.gt_labels: List[str] = []
+
+    def set_gt_map(self, gt_seed_map: np.ndarray, gt_labels: List[str]) -> None:
+        import cv2 as _cv2
+        self.gt_seed_map = gt_seed_map
+        self.gt_labels   = gt_labels
+        # Build per-label dilated map (same label index as seed map)
+        r = self._DILATE_R
+        kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (r*2+1, r*2+1))
+        dilated = np.zeros_like(gt_seed_map)
+        for idx in range(1, len(gt_labels) + 1):
+            mask = (gt_seed_map == idx).astype(np.uint8)
+            if mask.any():
+                d = _cv2.dilate(mask, kernel, iterations=1)
+                dilated[d > 0] = idx   # later labels overwrite earlier; fine for counting
+        self.gt_dilated_map = dilated
+
+    def _lookup(self, label_map: np.ndarray, px: int, py: int) -> str:
+        gt_idx = int(label_map[px, py])
+        return (
+            self.gt_labels[gt_idx - 1]
+            if gt_idx > 0 and gt_idx <= len(self.gt_labels)
+            else "free"
+        )
+
+    def record(self, yolo_label: str, px: int, py: int) -> None:
+        """Record one projected YOLO detection against both GT maps."""
+        if self.gt_seed_map is None:
+            return
+        if not (0 <= px < self.gt_seed_map.shape[0] and 0 <= py < self.gt_seed_map.shape[1]):
+            return
+        self.counts_exact[(yolo_label,   self._lookup(self.gt_seed_map,    px, py))] += 1
+        self.counts_dilated[(yolo_label, self._lookup(self.gt_dilated_map, px, py))] += 1
+
+    def save_csv(self, path: str) -> None:
+        total = sum(self.counts_exact.values())
+        if total == 0:
+            print(f"[YOLODebug] No YOLO detections recorded, skipping {path}")
+            return
+
+        def _write_table(writer, counts, label):
+            writer.writerow([f"--- {label} ---"])
+            writer.writerow(["yolo_label", "gt_label", "count", "pct"])
+            tot = sum(counts.values())
+            for (yolo, gt), count in sorted(counts.items(), key=lambda x: -x[1]):
+                writer.writerow([yolo, gt, count, f"{count / tot * 100:.2f}"])
+            writer.writerow([])
+
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            _write_table(writer, self.counts_exact,   "EXACT seed match")
+            _write_table(writer, self.counts_dilated, f"DILATED match (±{self._DILATE_R} cells = ±{self._DILATE_R*0.1:.1f}m)")
+        print(f"[YOLODebug] Saved {len(self.counts_exact)} pairs ({total} detections) → {path}")

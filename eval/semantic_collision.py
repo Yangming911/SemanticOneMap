@@ -18,24 +18,13 @@ _SEMANTIC_LABEL_ALIASES = {
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    "person": 3,
-    "chair": 2,
-    "couch": 3,
-    "bed": 2,
-    "dining table": 3,
-    "potted plant": 2,
-    "tv": 2,
-    "toilet": 0,
-    "sink": 2,
-    "oven": 2,
-    "refrigerator": 3,
-    "microwave": 2,
-    "bottle": 2,
-    "cup": 2,
-    "vase": 2,
-    "clock": 1,
-    "book": 1,
-    "laptop": 1,
+    # Only objects that: (a) appear in open floor space, (b) are reliably
+    # detected + projected by YOLO (chair: 60.7% dilated precision),
+    # (c) are genuinely dangerous to hit, (d) have small enough radius
+    # not to block corridors.  TV/bed/couch removed: wall-mounted or
+    # large footprint → YOLO projection noise causes map flooding.
+    "chair": 4,
+    "potted plant": 3,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1

@@ -2,7 +2,7 @@
   OneMap Evaluation Summary
   2026-03-12 15:39:55
 ============================================================
-
+User Description: Testing semantic obstacle detection 
 [ Run Config ]
   Detector          : YOLOv7
   CLIP model        : weights/clip.pth

@@ -20,6 +20,7 @@ from config import SpotControllerConf
 from mobile_sam import sam_model_registry, SamPredictor
 from mapping.semantic_navigable_map import SemanticNavigableMapUpdater, build_semantic_label_config
 from mapping.semantic_debug import SemanticPredGTCollector
+from mapping.yolo_obstacle_map import YOLOObstacleMap
 
 # numpy
 import numpy as np
@@ -163,6 +164,15 @@ class Navigator:
         self.semantic_navigable_map = self.one_map.navigable_map.copy()
         self.debug_collector: SemanticPredGTCollector = None
 
+        self.use_yolo_obstacle_map = bool(getattr(config.mapping, "use_yolo_obstacle_map", False))
+        self.yolo_obstacle_map: YOLOObstacleMap = None
+        if self.use_yolo_obstacle_map:
+            window_size = int(getattr(config.mapping, "yolo_window_size", 50))
+            self.yolo_obstacle_map = YOLOObstacleMap(
+                self.one_map.n_cells, self.one_map.cell_size,
+                window_size=window_size,
+            )
+
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
         self.previous_sims = None
@@ -237,6 +247,8 @@ class Navigator:
         if self.use_clip_semantic_nav_map and self.semantic_map_updater is not None:
             self.semantic_map_updater.reset(self.one_map.navigable_map)
         self.semantic_navigable_map = self.one_map.navigable_map.copy()
+        if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
+            self.yolo_obstacle_map.reset()
         self.navigation_scores = np.zeros_like(self.semantic_navigable_map, dtype=np.float32)
         self.first_obs = True
         self.cyclic_checker = CyclicChecker()
@@ -270,13 +282,19 @@ class Navigator:
             self.previous_sims = None
             self.one_map.reset_checked_map()
             self.detector.set_classes(self.query_text)
+            if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
+                self.yolo_obstacle_map.set_query_label(self.query_text[0])
             self.object_detected = False
             self.get_map(False)
 
     def get_active_navigable_map(self) -> np.ndarray:
         if self.use_clip_semantic_nav_map and self.semantic_navigable_map is not None:
-            return self.semantic_navigable_map
-        return self.one_map.navigable_map
+            base = self.semantic_navigable_map
+        else:
+            base = self.one_map.navigable_map
+        if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
+            return self.yolo_obstacle_map.apply_to_navigable_map(base)
+        return base
 
     @torch.no_grad()
     def _update_semantic_navigable_map(self) -> None:
@@ -590,7 +608,16 @@ class Navigator:
         # Check if RGB or BGR correct?
         # TODO I think yolo wants rgb
         # detections = self.detector.detect(np.flip(image.transpose(1, 2, 0), axis=-1))
-        detections = self.detector.detect(image.transpose(1, 2, 0))
+        img_hwc = image.transpose(1, 2, 0)
+        detections = self.detector.detect(img_hwc)
+        if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None and \
+                hasattr(self.detector, "get_obstacle_detections") and self.one_map.camera_initialized:
+            obstacle_dets = self.detector.get_obstacle_detections()
+            self.yolo_obstacle_map.update(
+                obstacle_dets, depth, odometry,
+                self.one_map.fx, self.one_map.fy, self.one_map.cx, self.one_map.cy,
+                img_hwc.shape[0], img_hwc.shape[1],
+            )
         a = time.time()
         image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
         b = time.time()
