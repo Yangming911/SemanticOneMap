@@ -43,7 +43,7 @@ class YOLOv7Detector:
         self.class_map["couch"] = "sofa"
         self.class_map["bed"] = "bed"
         self.class_map["toilet"] = "toilet"
-        classes_oi = ["chair", "tv", "potted plant", "bed", "toilet", "couch"]
+        classes_oi = ["chair", "tv", "potted plant", "bed", "toilet", "couch", "dining table"]
         self.classes_oi = [COCO_CLASSES.index(c) for c in classes_oi]
         self.classes_oi_names = classes_oi  # human-readable names for obstacle detection
         self._last_obstacle_detections: dict = {}  # cached from last detect() call

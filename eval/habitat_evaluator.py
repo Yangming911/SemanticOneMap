@@ -121,7 +121,12 @@ class HabitatEvaluator:
                                                                                 self.object_nav_path)
         if self.actor is not None:
             self.logger = rerun_logger.RerunLogger(self.actor.mapper, False, "") if self.log_rerun else None
-        self.results_path = "/home/finn/active/MON/results_gibson" if self.is_gibson else "results/"
+        self.results_path = "/home/finn/active/MON/results_gibson" if self.is_gibson else config.results_path
+        for _sub in ("trajectories", "similarities", "state"):
+            os.makedirs(os.path.join(self.results_path, _sub), exist_ok=True)
+        ep_start = getattr(config, "ep_start", 0)
+        ep_end = getattr(config, "ep_end", 999999)
+        self.episodes = self.episodes[ep_start:ep_end]
         self.semantic_collision_cache = {}
         self.debug_collector = SemanticPredGTCollector()
         if self.actor is not None:
@@ -192,15 +197,19 @@ class HabitatEvaluator:
             )
         return self.semantic_collision_cache[cache_key]
 
-    def check_semantic_collision(self, scene_id: str, query_label: str) -> bool:
+    def check_semantic_collision(self, scene_id: str, query_label: str):
+        """Return (collided: bool, causing_label: str | None)."""
         collision_data = self.get_semantic_collision_data(scene_id, query_label)
         position = self.sim.get_agent(0).get_state().position
         x = -position[2]
         y = -position[0]
         px, py = metric_to_px(x, y, self.mapping.n_points, self.mapping.size / self.mapping.n_points)
         if 0 <= px < self.mapping.n_points and 0 <= py < self.mapping.n_points:
-            return bool(collision_data.collision_map[px, py])
-        return False
+            if collision_data.collision_map[px, py]:
+                idx = int(collision_data.label_map[px, py])
+                label = collision_data.labels[idx - 1] if 0 < idx <= len(collision_data.labels) else "unknown"
+                return True, label
+        return False, None
 
 
 
@@ -345,6 +354,7 @@ class HabitatEvaluator:
         obj_count = {}
         results = []
         spl_accum = 0.0
+        collision_log = []  # list of (episode_id, query_label, causing_label)
         path_lengths = {}
         # restart at 930
         for n_ep, episode in enumerate(self.episodes):
@@ -415,9 +425,11 @@ class HabitatEvaluator:
                 if self.log_rerun:
                     self.logger.log_map()
 
-                if self.check_semantic_collision(episode.scene_id, current_obj):
+                collided, cause_label = self.check_semantic_collision(episode.scene_id, current_obj)
+                if collided:
                     results[n_ep] = Result.SEMANTIC_COLLISION
-                    print("Semantic collision detected!")
+                    collision_log.append((episode.episode_id, current_obj, cause_label))
+                    print(f"Semantic collision detected! cause={cause_label}")
                     break
 
                 if called_found:
@@ -491,6 +503,13 @@ class HabitatEvaluator:
         self.debug_collector.save_csv(f"{self.results_path}/semantic_pred_gt_pairs_{_ts}.csv")
         self.debug_collector.save_sim_distribution_csv(f"{self.results_path}/semantic_sim_distribution_{_ts}.csv")
         self.yolo_debug_collector.save_csv(f"{self.results_path}/yolo_obstacle_pred_gt_{_ts}.csv")
+        # Save per-collision cause log
+        import csv
+        collision_csv = f"{self.results_path}/collision_causes_{_ts}.csv"
+        with open(collision_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["episode_id", "query_label", "cause_label"])
+            w.writerows(collision_log)
         sr = success / n_eps if n_eps > 0 else 0.0
         spl = spl_accum / n_eps if n_eps > 0 else 0.0
         result_counts = {r: results.count(r) for r in Result}

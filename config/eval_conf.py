@@ -17,6 +17,9 @@ class EvalConf:
     scene_path: str
     use_pointnav: bool
     square_im: bool
+    results_path: str = "results/"
+    ep_start: int = 0        # first episode index (inclusive)
+    ep_end: int = 999999     # last episode index (exclusive), 999999 = all
 
 
 def load_eval_config():

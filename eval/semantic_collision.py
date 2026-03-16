@@ -25,6 +25,7 @@ _SEMANTIC_SAFETY_RADIUS_CELLS = {
     # large footprint → YOLO projection noise causes map flooding.
     "chair": 4,
     "potted plant": 3,
+    "dining table": 4,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1
