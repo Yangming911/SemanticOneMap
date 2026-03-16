@@ -43,9 +43,9 @@ class YOLOv7Detector:
         self.class_map["couch"] = "sofa"
         self.class_map["bed"] = "bed"
         self.class_map["toilet"] = "toilet"
-        classes_oi = ["chair", "tv", "potted plant", "bed", "toilet", "couch", "dining table"]
-        self.classes_oi = [COCO_CLASSES.index(c) for c in classes_oi]
-        self.classes_oi_names = classes_oi  # human-readable names for obstacle detection
+        classes_oi = None  # NMS sees all classes; YOLOObstacleMap filters by _SEMANTIC_SAFETY_RADIUS_CELLS
+        self.classes_oi = classes_oi
+        self.classes_oi_names = COCO_CLASSES  # track all classes for obstacle detection
         self._last_obstacle_detections: dict = {}  # cached from last detect() call
         # self.classes_oi = None
 
@@ -106,8 +106,8 @@ class YOLOv7Detector:
         preds["boxes"] = []
         preds["scores"] = []
 
-        # Cache all obstacle-class detections grouped by class name
-        obstacle_detections: dict = {name: [] for name in self.classes_oi_names}
+        # Cache all detections grouped by class name (all detected COCO classes)
+        obstacle_detections: dict = {}
 
         for i in range(pred.shape[0]):
             class_name = COCO_CLASSES[int(pred[i, 5])]
@@ -120,8 +120,9 @@ class YOLOv7Detector:
                 preds["boxes"].append(box_list)
                 preds["scores"].append(logits[i])
 
-            if class_name in obstacle_detections:
-                obstacle_detections[class_name].append(box_list)
+            if class_name not in obstacle_detections:
+                obstacle_detections[class_name] = []
+            obstacle_detections[class_name].append(box_list)
 
         self._last_obstacle_detections = obstacle_detections
         # print(f"YOLO forward: {time.time() - a}")

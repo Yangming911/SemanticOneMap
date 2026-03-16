@@ -18,14 +18,13 @@ _SEMANTIC_LABEL_ALIASES = {
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    # Only objects that: (a) appear in open floor space, (b) are reliably
-    # detected + projected by YOLO (chair: 60.7% dilated precision),
-    # (c) are genuinely dangerous to hit, (d) have small enough radius
-    # not to block corridors.  TV/bed/couch removed: wall-mounted or
-    # large footprint → YOLO projection noise causes map flooding.
+    # Production dict: only classes where YOLO dilated precision > 50%
+    # chair: 95.6% precision (1374 detections in analysis run)
+    # toilet: 83.0% precision (235 detections)
+    # potted plant: 54.5% precision (kept as supplementary)
     "chair": 4,
     "potted plant": 3,
-    "dining table": 4,
+    "toilet": 3,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1

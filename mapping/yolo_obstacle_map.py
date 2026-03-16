@@ -132,8 +132,8 @@ class YOLOObstacleMap:
                 continue
 
             radius = _SEMANTIC_SAFETY_RADIUS_CELLS.get(label, -1)
-            if radius < 0:
-                continue
+            # Always project for debug collection; only add to obstacle events if in dict
+            debug_only = radius < 0
 
             for box in boxes:
                 x1, y1, x2, y2 = box
@@ -167,7 +167,8 @@ class YOLOObstacleMap:
                 py = int(y_rot / self.cell_size) + self.map_center
 
                 if 0 <= px < self.n_cells and 0 <= py < self.n_cells:
-                    self._events.append((self._frame_idx, label, px, py))
+                    if not debug_only:
+                        self._events.append((self._frame_idx, label, px, py))
                     if self.debug_collector is not None:
                         self.debug_collector.record(label, px, py)
 
@@ -191,6 +192,21 @@ class YOLOObstacleMap:
             dilated = cv2.dilate(seed, kernel, iterations=1)
             combined |= dilated.astype(bool)
         return combined
+
+    # ------------------------------------------------------------------
+    def get_nearest_event(self, px: int, py: int) -> Optional[Tuple[str, float]]:
+        """Return (label, distance_cells) of the nearest event in the current window,
+        or None if the window is empty."""
+        best_label: Optional[str] = None
+        best_dist = float("inf")
+        for _frame, label, ex, ey in self._events:
+            dist = ((ex - px) ** 2 + (ey - py) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_label = label
+        if best_label is None:
+            return None
+        return best_label, best_dist
 
     # ------------------------------------------------------------------
     def apply_to_navigable_map(self, base_nav_map: np.ndarray) -> np.ndarray:
