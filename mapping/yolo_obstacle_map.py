@@ -59,6 +59,9 @@ class YOLOObstacleMap:
         self._events: Deque[Tuple[int, str, int, int]] = deque()
         self._frame_idx: int = 0
 
+        # Events projected in the most recent update() call — used by OACP calibration
+        self.latest_projected: List[Tuple[str, int, int]] = []  # [(label, px, py), ...]
+
         # Pre-compute dilation kernels per radius
         self._kernels: Dict[int, np.ndarray] = {}
         # Current query label — excluded from obstacle marking
@@ -118,6 +121,7 @@ class YOLOObstacleMap:
         """
         self._frame_idx += 1
         self._prune_old_events()
+        self.latest_projected = []  # reset per-frame list
 
         yaw = float(np.arctan2(tf[1, 0], tf[0, 0]))
         cam_x = float(tf[0, 3] / tf[3, 3])
@@ -169,6 +173,7 @@ class YOLOObstacleMap:
                 if 0 <= px < self.n_cells and 0 <= py < self.n_cells:
                     if not debug_only:
                         self._events.append((self._frame_idx, label, px, py))
+                    self.latest_projected.append((label, px, py))
                     if self.debug_collector is not None:
                         self.debug_collector.record(label, px, py)
 
@@ -192,21 +197,6 @@ class YOLOObstacleMap:
             dilated = cv2.dilate(seed, kernel, iterations=1)
             combined |= dilated.astype(bool)
         return combined
-
-    # ------------------------------------------------------------------
-    def get_nearest_event(self, px: int, py: int) -> Optional[Tuple[str, float]]:
-        """Return (label, distance_cells) of the nearest event in the current window,
-        or None if the window is empty."""
-        best_label: Optional[str] = None
-        best_dist = float("inf")
-        for _frame, label, ex, ey in self._events:
-            dist = ((ex - px) ** 2 + (ey - py) ** 2) ** 0.5
-            if dist < best_dist:
-                best_dist = dist
-                best_label = label
-        if best_label is None:
-            return None
-        return best_label, best_dist
 
     # ------------------------------------------------------------------
     def apply_to_navigable_map(self, base_nav_map: np.ndarray) -> np.ndarray:

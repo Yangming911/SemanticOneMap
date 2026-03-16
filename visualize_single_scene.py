@@ -247,35 +247,38 @@ def build_ground_truth_semantic_panel(evaluator: HabitatEvaluator, scene_id: str
     return cv2.resize(oriented, (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
 
 
-def build_yolo_obstacle_panel(mapper, evaluator, scene_id: str, query_label: str) -> np.ndarray:
-    """Depth-based navigable map + YOLO semantic inflation overlay (no GT).
+def build_obstacle_layers_panel(mapper) -> np.ndarray:
+    """Combined obstacle panel showing all active layers.
 
-    Layer order (bottom → top):
-      white  : navigable (neither depth nor YOLO blocked)
-      grey   : depth point-cloud obstacle (agent-radius dilated)
-      orange : YOLO seed points (raw projected bbox centres)
-      red    : YOLO semantic inflation (dilated obstacle mask)
+    Layer order (bottom → top, each overwrites previous):
+      white   : navigable (all layers clear)
+      grey    : depth point-cloud obstacle
+      red     : YOLO dilated obstacle mask
+      orange  : YOLO raw seed points
+      purple  : CLIP-CP dilated obstacle mask
+      cyan    : CLIP-CP seed cells (raw, before dilation)
     """
     n = mapper.one_map.n_cells
-    panel = np.zeros((n, n, 3), dtype=np.uint8)
+    panel = np.full((n, n, 3), 255, dtype=np.uint8)   # start white
 
-    # Layer 1: depth obstacles (grey, same style as other panels)
     base_nav = mapper.one_map.navigable_map.astype(bool)
-    panel[~base_nav] = (80, 80, 80)         # depth obstacle → grey
+    panel[~base_nav] = (80, 80, 80)                   # depth obstacle → grey
 
-    # Layer 2: YOLO inflation on top
     yolo_map = getattr(mapper, "yolo_obstacle_map", None)
     if yolo_map is not None:
         yolo_mask = yolo_map.get_obstacle_mask()
-        # Cells blocked by YOLO (on top of navigable) → red
-        yolo_only = yolo_mask & base_nav
-        panel[yolo_only] = (0, 0, 200)      # red (BGR)
-        # Raw seeds (within window) on top → orange
+        panel[yolo_mask & base_nav] = (0, 0, 200)     # YOLO dilated → red
         for _frame, _label, px, py in yolo_map._events:
-            panel[px, py] = (0, 140, 255)   # orange (BGR)
+            panel[px, py] = (0, 140, 255)             # YOLO seeds → orange
 
-    oriented = orient_xy_map(panel)
-    return cv2.resize(oriented, (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
+    cp_map = getattr(mapper, "clip_cp_obstacle_map", None)
+    if cp_map is not None and getattr(mapper, "use_clip_cp_obstacle_map", False):
+        cp_mask = cp_map.get_obstacle_mask()
+        panel[cp_mask & base_nav] = (180, 0, 180)     # CP dilated → purple
+        cp_seeds = cp_map._seed_map > 0
+        panel[cp_seeds & base_nav] = (255, 200, 0)    # CP seeds → cyan
+
+    return cv2.resize(orient_xy_map(panel), (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
 
 
 def build_obstacle_panel(mapper) -> np.ndarray:

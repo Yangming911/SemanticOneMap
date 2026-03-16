@@ -26,4 +26,9 @@ class MappingConf:
     clip_semantic_sim_threshold: float
     use_yolo_obstacle_map: bool
     yolo_window_size: int
+    use_clip_cp_obstacle_map: bool
+    clip_cp_threshold: float
+    clip_cp_use_oacp: bool
+    clip_cp_target_coverage: float
+    clip_cp_window_size: int
 

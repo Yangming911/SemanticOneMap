@@ -198,7 +198,7 @@ class HabitatEvaluator:
         return self.semantic_collision_cache[cache_key]
 
     def check_semantic_collision(self, scene_id: str, query_label: str):
-        """Return (collided: bool, causing_label: str | None, debug_dict | None)."""
+        """Return (collided: bool, causing_label: str | None)."""
         collision_data = self.get_semantic_collision_data(scene_id, query_label)
         position = self.sim.get_agent(0).get_state().position
         x = -position[2]
@@ -208,47 +208,8 @@ class HabitatEvaluator:
             if collision_data.collision_map[px, py]:
                 idx = int(collision_data.label_map[px, py])
                 label = collision_data.labels[idx - 1] if 0 < idx <= len(collision_data.labels) else "unknown"
-                debug = self._collision_debug_info(px, py, label, query_label)
-                return True, label, debug
-        return False, None, None
-
-    def _collision_debug_info(self, px: int, py: int, cause_label: str, query_label: str) -> dict:
-        """Collect debug info at the collision cell for analysis."""
-        info = {"px": px, "py": py}
-
-        # 1. Was the YOLO mask covering this cell?
-        mapper = getattr(self.actor, "mapper", None)
-        yolo_map = getattr(mapper, "yolo_obstacle_map", None) if mapper else None
-        if yolo_map is not None:
-            mask = yolo_map.get_obstacle_mask()
-            info["yolo_masked"] = bool(mask[px, py])
-            nearest = yolo_map.get_nearest_event(px, py)
-            if nearest is not None:
-                info["nearest_yolo_label"] = nearest[0]
-                info["nearest_yolo_dist_cells"] = round(nearest[1], 2)
-            else:
-                info["nearest_yolo_label"] = "none"
-                info["nearest_yolo_dist_cells"] = -1
-        else:
-            info["yolo_masked"] = False
-            info["nearest_yolo_label"] = "n/a"
-            info["nearest_yolo_dist_cells"] = -1
-
-        # 2. CLIP feature at collision cell → similarity to cause/query labels
-        try:
-            feature_map = mapper.one_map.feature_map  # [X, Y, F]
-            feat = feature_map[px, py, :]             # [F]
-            import torch, torch.nn.functional as F
-            feat_norm = F.normalize(feat.unsqueeze(0), dim=1)  # [1, F]
-            for tag, txt in [("cause", "a " + cause_label), ("query", "a " + query_label)]:
-                text_feat = mapper.model.get_text_features([txt]).to(feat.device)  # [1, F]
-                sim = float(torch.mm(feat_norm, text_feat.T).squeeze())
-                info[f"clip_sim_{tag}"] = round(sim, 4)
-        except Exception as e:
-            info["clip_sim_cause"] = -99
-            info["clip_sim_query"] = -99
-
-        return info
+                return True, label
+        return False, None
 
 
 
@@ -394,7 +355,6 @@ class HabitatEvaluator:
         results = []
         spl_accum = 0.0
         collision_log = []  # list of (episode_id, query_label, causing_label)
-        collision_detail_log = []  # list of dicts with per-collision debug info
         path_lengths = {}
         # restart at 930
         for n_ep, episode in enumerate(self.episodes):
@@ -465,15 +425,10 @@ class HabitatEvaluator:
                 if self.log_rerun:
                     self.logger.log_map()
 
-                collided, cause_label, coll_debug = self.check_semantic_collision(episode.scene_id, current_obj)
+                collided, cause_label = self.check_semantic_collision(episode.scene_id, current_obj)
                 if collided:
                     results[n_ep] = Result.SEMANTIC_COLLISION
                     collision_log.append((episode.episode_id, current_obj, cause_label))
-                    if coll_debug is not None:
-                        coll_debug["episode_id"] = episode.episode_id
-                        coll_debug["query_label"] = current_obj
-                        coll_debug["cause_label"] = cause_label
-                        collision_detail_log.append(coll_debug)
                     print(f"Semantic collision detected! cause={cause_label}")
                     break
 
@@ -555,17 +510,6 @@ class HabitatEvaluator:
             w = csv.writer(f)
             w.writerow(["episode_id", "query_label", "cause_label"])
             w.writerows(collision_log)
-        # Save per-collision detail debug log
-        if collision_detail_log:
-            detail_fields = ["episode_id", "query_label", "cause_label",
-                             "px", "py", "yolo_masked",
-                             "nearest_yolo_label", "nearest_yolo_dist_cells",
-                             "clip_sim_cause", "clip_sim_query"]
-            detail_csv = f"{self.results_path}/collision_detail_{_ts}.csv"
-            with open(detail_csv, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=detail_fields, extrasaction="ignore")
-                w.writeheader()
-                w.writerows(collision_detail_log)
         sr = success / n_eps if n_eps > 0 else 0.0
         spl = spl_accum / n_eps if n_eps > 0 else 0.0
         result_counts = {r: results.count(r) for r in Result}
