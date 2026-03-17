@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Run 3 minival experiments in parallel and merge logs when done.
+# Run yolocp v2 (Method B + sliding window) as 3 parallel shards of 10 episodes.
 set -euo pipefail
 
-LOGDIR="/tmp/minival_logs"
-SUMMARY="/tmp/minival_summary.log"
+LOGDIR="/tmp/minival_v2_logs"
+SUMMARY="/tmp/minival_v2_summary.log"
 mkdir -p "$LOGDIR"
-
-cd /opt/data/private/onemap/OneMap_obstacle
 
 run_exp() {
     local name="$1"
@@ -21,15 +19,14 @@ run_exp() {
 
 export -f run_exp
 
-# Launch all 3 in parallel
-run_exp minival_baseline  config/mon/eval_conf_minival_baseline.yaml  &
+run_exp yolocp_s0 config/mon/eval_conf_minival_yolocp_s0.yaml &
 PID0=$!
-run_exp minival_yolo      config/mon/eval_conf_minival_yolo.yaml      &
+run_exp yolocp_s1 config/mon/eval_conf_minival_yolocp_s1.yaml &
 PID1=$!
-run_exp minival_yolocp    config/mon/eval_conf_minival_yolocp.yaml    &
+run_exp yolocp_s2 config/mon/eval_conf_minival_yolocp_s2.yaml &
 PID2=$!
 
-echo "PIDs: baseline=$PID0  yolo=$PID1  yolocp=$PID2"
+echo "PIDs: s0=$PID0  s1=$PID1  s2=$PID2"
 echo "Logs in $LOGDIR"
 
 wait $PID0; S0=$?
@@ -38,18 +35,18 @@ wait $PID2; S2=$?
 
 echo ""
 echo "========================================"
-echo "All done. Exit codes: baseline=$S0 yolo=$S1 yolocp=$S2"
+echo "All done. Exit codes: s0=$S0 s1=$S1 s2=$S2"
 echo "========================================"
 
-# Merge into one summary file
+# Merge into one summary
 {
     echo "========================================"
-    echo "  MINIVAL SUMMARY — $(date)"
+    echo "  MINIVAL V2 YOLOCP SUMMARY — $(date)"
     echo "========================================"
-    for name in minival_baseline minival_yolo minival_yolocp; do
+    for name in yolocp_s0 yolocp_s1 yolocp_s2; do
         echo ""
         echo "----------------------------------------"
-        echo "  EXPERIMENT: $name"
+        echo "  SHARD: $name"
         echo "----------------------------------------"
         cat "$LOGDIR/${name}.log"
     done
@@ -60,3 +57,8 @@ echo "========================================"
 } > "$SUMMARY"
 
 echo "Summary written to: $SUMMARY"
+
+# Extract and aggregate key metrics
+echo ""
+echo "=== AGGREGATED METRICS ==="
+grep -h "SR\|SPL\|SEMANTIC_COLLISION\|FAILURE" "$LOGDIR"/yolocp_s*.log | grep -v "^Result" | sort | uniq -c | sort -rn | head -20

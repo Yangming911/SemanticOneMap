@@ -143,39 +143,62 @@ class YOLOObstacleMap:
                 x1, y1, x2, y2 = box
                 x1_i = max(0, int(x1))
                 y1_i = max(0, int(y1))
-                x2_i = min(image_w - 1, int(x2))
-                y2_i = min(image_h - 1, int(y2))
+                x2_i = min(image_w - 1, int(x2) + 1)
+                y2_i = min(image_h - 1, int(y2) + 1)
                 if x1_i >= x2_i or y1_i >= y2_i:
                     continue
 
-                roi = depth[y1_i:y2_i, x1_i:x2_i]
-                valid = roi[(roi > 0) & np.isfinite(roi)]
-                if len(valid) == 0:
+                # --- Method B: per-pixel back-projection ---
+                ys_arr, xs_arr = np.mgrid[y1_i:y2_i, x1_i:x2_i]
+                ds_arr = depth[y1_i:y2_i, x1_i:x2_i]
+
+                valid_mask = (ds_arr > 0) & np.isfinite(ds_arr)
+                if not valid_mask.any():
                     continue
-                d = float(np.median(valid))
 
-                # Bbox centre in image coords (column = horizontal = u)
-                u = (x1 + x2) / 2.0
+                med_d = float(np.median(ds_arr[valid_mask]))
+                # Keep foreground pixels (≤ median × 1.2) to exclude background walls
+                fg_mask = valid_mask & (ds_arr <= med_d * 1.2)
+                if not fg_mask.any():
+                    fg_mask = valid_mask
 
-                # Back-project to 3D world: same convention as navigator.py
-                #   x_world = depth (forward)
-                #   y_world = -(u - cx) * d / fx (lateral, rightward is negative)
-                x_world = d
-                y_world = -(u - cx) * d / fx
+                ds_v = ds_arr[fg_mask]
+                us_v = xs_arr[fg_mask].astype(np.float32)
 
-                # Apply yaw rotation and camera offset
-                x_rot = x_world * cos_yaw - y_world * sin_yaw + cam_x
-                y_rot = x_world * sin_yaw + y_world * cos_yaw + cam_y
+                x_world_v = ds_v
+                y_world_v = -(us_v - cx) * ds_v / fx
+                x_rot_v = x_world_v * cos_yaw - y_world_v * sin_yaw + cam_x
+                y_rot_v = x_world_v * sin_yaw + y_world_v * cos_yaw + cam_y
 
-                px = int(x_rot / self.cell_size) + self.map_center
-                py = int(y_rot / self.cell_size) + self.map_center
+                pxs_v = (x_rot_v / self.cell_size).astype(int) + self.map_center
+                pys_v = (y_rot_v / self.cell_size).astype(int) + self.map_center
 
-                if 0 <= px < self.n_cells and 0 <= py < self.n_cells:
+                in_bounds = (
+                    (pxs_v >= 0) & (pxs_v < self.n_cells) &
+                    (pys_v >= 0) & (pys_v < self.n_cells)
+                )
+                pxs_b = pxs_v[in_bounds]
+                pys_b = pys_v[in_bounds]
+                if len(pxs_b) == 0:
+                    continue
+
+                # Deduplicate projected cells
+                unique_cells = np.unique(np.stack([pxs_b, pys_b], axis=1), axis=0)
+                for cell_px, cell_py in unique_cells:
                     if not debug_only:
-                        self._events.append((self._frame_idx, label, px, py))
-                    self.latest_projected.append((label, px, py))
-                    if self.debug_collector is not None:
-                        self.debug_collector.record(label, px, py)
+                        self._events.append((self._frame_idx, label, int(cell_px), int(cell_py)))
+                    self.latest_projected.append((label, int(cell_px), int(cell_py)))
+                if self.debug_collector is not None:
+                    # Report representative single point (median-depth cell) for debug
+                    med_u = float(x1 + x2) / 2.0
+                    x_w = med_d
+                    y_w = -(med_u - cx) * med_d / fx
+                    xr = x_w * cos_yaw - y_w * sin_yaw + cam_x
+                    yr = x_w * sin_yaw + y_w * cos_yaw + cam_y
+                    px_dbg = int(xr / self.cell_size) + self.map_center
+                    py_dbg = int(yr / self.cell_size) + self.map_center
+                    if 0 <= px_dbg < self.n_cells and 0 <= py_dbg < self.n_cells:
+                        self.debug_collector.record(label, px_dbg, py_dbg)
 
     # ------------------------------------------------------------------
     def get_obstacle_mask(self) -> np.ndarray:

@@ -61,6 +61,10 @@ class YOLOCPObstacleMap:
 
         # Per-cell max confidence: [n_cells, n_cells, n_obstacle_classes]
         self._conf_map = np.zeros((n_cells, n_cells, n_cls), dtype=np.float32)
+        # Frame index at which each cell was last updated (0 = never seen)
+        self._conf_frame = np.zeros((n_cells, n_cells, n_cls), dtype=np.int32)
+        self._frame_idx: int = 0
+        self._conf_window: int = window_size  # same window used for CP scores
 
         # CP state
         self.threshold = threshold
@@ -108,6 +112,8 @@ class YOLOCPObstacleMap:
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self._conf_map.fill(0.0)
+        self._conf_frame.fill(0)
+        self._frame_idx = 0
         self._scores.clear()
 
     # ------------------------------------------------------------------
@@ -125,10 +131,16 @@ class YOLOCPObstacleMap:
     ) -> None:
         """Project YOLO detections and store max confidence per cell.
 
+        Method B: all depth pixels within the bounding box are back-projected
+        to map cells (rather than a single bbox-centre point).  Only foreground
+        pixels (depth ≤ median × 1.2) are used to avoid projecting background
+        geometry behind the detected object.
+
         Args:
             detections_with_conf: {class_name: [(box, conf), ...]}
                                    box = [x1, y1, x2, y2] in pixel coords.
         """
+        self._frame_idx += 1
         yaw = float(np.arctan2(tf[1, 0], tf[0, 0]))
         cam_x = float(tf[0, 3] / tf[3, 3])
         cam_y = float(tf[1, 3] / tf[3, 3])
@@ -144,29 +156,54 @@ class YOLOCPObstacleMap:
                 x1, y1, x2, y2 = box
                 x1_i = max(0, int(x1))
                 y1_i = max(0, int(y1))
-                x2_i = min(image_w - 1, int(x2))
-                y2_i = min(image_h - 1, int(y2))
+                x2_i = min(image_w - 1, int(x2) + 1)
+                y2_i = min(image_h - 1, int(y2) + 1)
                 if x1_i >= x2_i or y1_i >= y2_i:
                     continue
 
-                roi = depth[y1_i:y2_i, x1_i:x2_i]
-                valid = roi[(roi > 0) & np.isfinite(roi)]
-                if len(valid) == 0:
+                # --- Method B: per-pixel back-projection ---
+                ys_arr, xs_arr = np.mgrid[y1_i:y2_i, x1_i:x2_i]
+                ds_arr = depth[y1_i:y2_i, x1_i:x2_i]
+
+                valid_mask = (ds_arr > 0) & np.isfinite(ds_arr)
+                if not valid_mask.any():
                     continue
-                d = float(np.median(valid))
 
-                u = (x1 + x2) / 2.0
-                x_world = d
-                y_world = -(u - cx) * d / fx
-                x_rot = x_world * cos_yaw - y_world * sin_yaw + cam_x
-                y_rot = x_world * sin_yaw + y_world * cos_yaw + cam_y
+                med_d = float(np.median(ds_arr[valid_mask]))
+                # Keep only foreground (≤ median × 1.2 to exclude background walls)
+                fg_mask = valid_mask & (ds_arr <= med_d * 1.2)
+                if not fg_mask.any():
+                    fg_mask = valid_mask
 
-                px = int(x_rot / self.cell_size) + self.map_center
-                py = int(y_rot / self.cell_size) + self.map_center
+                ds_v = ds_arr[fg_mask]
+                us_v = xs_arr[fg_mask].astype(np.float32)
 
-                if 0 <= px < self.n_cells and 0 <= py < self.n_cells:
-                    if conf > self._conf_map[px, py, class_idx]:
-                        self._conf_map[px, py, class_idx] = conf
+                x_world_v = ds_v
+                y_world_v = -(us_v - cx) * ds_v / fx
+
+                x_rot_v = x_world_v * cos_yaw - y_world_v * sin_yaw + cam_x
+                y_rot_v = x_world_v * sin_yaw + y_world_v * cos_yaw + cam_y
+
+                pxs_v = (x_rot_v / self.cell_size).astype(int) + self.map_center
+                pys_v = (y_rot_v / self.cell_size).astype(int) + self.map_center
+
+                in_bounds = (
+                    (pxs_v >= 0) & (pxs_v < self.n_cells) &
+                    (pys_v >= 0) & (pys_v < self.n_cells)
+                )
+                pxs_b = pxs_v[in_bounds]
+                pys_b = pys_v[in_bounds]
+                if len(pxs_b) == 0:
+                    continue
+
+                # Deduplicate and update conf_map + frame stamp
+                unique_cells = np.unique(np.stack([pxs_b, pys_b], axis=1), axis=0)
+                pxs_u, pys_u = unique_cells[:, 0], unique_cells[:, 1]
+                update_mask = conf > self._conf_map[pxs_u, pys_u, class_idx]
+                self._conf_map[pxs_u[update_mask], pys_u[update_mask], class_idx] = conf
+                # Stamp ALL projected cells (even if conf didn't improve) so the
+                # window keeps them alive as long as they're still being seen.
+                self._conf_frame[pxs_u, pys_u, class_idx] = self._frame_idx
 
     # ------------------------------------------------------------------
     def calibrate_with_gt(
@@ -229,7 +266,9 @@ class YOLOCPObstacleMap:
             class_idx = self._class_to_idx[gt_label]
             cpx, cpy = obs_coords[i]
             conf = float(self._conf_map[cpx, cpy, class_idx])
-            if conf > 0.0:                      # skip cells YOLO never detected
+            frame = int(self._conf_frame[cpx, cpy, class_idx])
+            in_window = (self._frame_idx - frame) <= self._conf_window
+            if conf > 0.0 and in_window:        # skip cells YOLO never detected or too old
                 self._scores.append(1.0 - conf)
 
         if len(self._scores) >= self._min_samples:
@@ -239,11 +278,17 @@ class YOLOCPObstacleMap:
 
     # ------------------------------------------------------------------
     def get_obstacle_mask(self) -> np.ndarray:
-        """Return dilated obstacle mask (True = blocked)."""
+        """Return dilated obstacle mask (True = blocked).
+
+        Only cells updated within the last _conf_window frames are considered,
+        so stale projections from previous rooms cannot permanently block paths.
+        """
+        cutoff = self._frame_idx - self._conf_window
         combined = np.zeros((self.n_cells, self.n_cells), dtype=bool)
         for class_name, class_idx in self._class_to_idx.items():
             radius = _SEMANTIC_SAFETY_RADIUS_CELLS[class_name]
-            seed = self._conf_map[:, :, class_idx] >= self.threshold
+            in_window = self._conf_frame[:, :, class_idx] > cutoff
+            seed = (self._conf_map[:, :, class_idx] >= self.threshold) & in_window
             if not seed.any():
                 continue
             kernel = self._get_kernel(radius)
