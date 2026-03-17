@@ -255,8 +255,8 @@ def build_obstacle_layers_panel(mapper) -> np.ndarray:
       grey    : depth point-cloud obstacle
       red     : YOLO dilated obstacle mask
       orange  : YOLO raw seed points
-      purple  : CLIP-CP dilated obstacle mask
-      cyan    : CLIP-CP seed cells (raw, before dilation)
+      purple  : YOLO-CP dilated obstacle mask
+      cyan    : YOLO-CP conf seeds (cells where conf > τ before dilation)
     """
     n = mapper.one_map.n_cells
     panel = np.full((n, n, 3), 255, dtype=np.uint8)   # start white
@@ -271,18 +271,18 @@ def build_obstacle_layers_panel(mapper) -> np.ndarray:
         for _frame, _label, px, py in yolo_map._events:
             panel[px, py] = (0, 140, 255)             # YOLO seeds → orange
 
-    cp_map = getattr(mapper, "clip_cp_obstacle_map", None)
-    if cp_map is not None and getattr(mapper, "use_clip_cp_obstacle_map", False):
-        cp_mask = cp_map.get_obstacle_mask()
-        panel[cp_mask & base_nav] = (180, 0, 180)     # CP dilated → purple
-        cp_seeds = cp_map._seed_map > 0
-        panel[cp_seeds & base_nav] = (255, 200, 0)    # CP seeds → cyan
+    yolo_cp_map = getattr(mapper, "yolo_cp_obstacle_map", None)
+    if yolo_cp_map is not None and getattr(mapper, "use_yolo_cp_obstacle_map", False):
+        cp_mask = yolo_cp_map.get_obstacle_mask()
+        panel[cp_mask & base_nav] = (180, 0, 180)     # YOLO-CP dilated → purple
+        # Show conf seeds: any cell where max conf across classes ≥ τ
+        cp_seeds = (yolo_cp_map._conf_map.max(axis=2) >= yolo_cp_map.threshold)
+        panel[cp_seeds & base_nav] = (255, 200, 0)    # YOLO-CP seeds → cyan/yellow
 
     return cv2.resize(orient_xy_map(panel), (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
 
 
-def build_obstacle_panel(mapper) -> np.ndarray:
-    navigable_map = mapper.get_active_navigable_map() if hasattr(mapper, "get_active_navigable_map") else mapper.one_map.navigable_map
+def build_obstacle_panel(navigable_map: np.ndarray) -> np.ndarray:
     dilated_obstacles = (~navigable_map.astype(bool)).astype(np.uint8)
     panel = np.zeros((dilated_obstacles.shape[0], dilated_obstacles.shape[1], 3), dtype=np.uint8)
     panel[dilated_obstacles > 0] = np.array([230, 230, 230], dtype=np.uint8)
@@ -292,15 +292,13 @@ def build_obstacle_panel(mapper) -> np.ndarray:
 
 def draw_path_robot_goal(
     panel: np.ndarray,
-    mapper,
+    map_shape: Tuple[int, int],
     robot_px: Tuple[int, int],
     path,
     chosen_detection,
     title: str,
 ) -> np.ndarray:
     canvas = panel.copy()
-    navigable_map = mapper.get_active_navigable_map() if hasattr(mapper, "get_active_navigable_map") else mapper.one_map.navigable_map
-    map_shape = navigable_map.shape
 
     if isinstance(path, list) and len(path) > 1:
         path_pts = path_to_display(path, map_shape, PANEL_SIZE)
@@ -368,7 +366,8 @@ def classify_result(
     called_found: bool,
     poses: List[np.ndarray],
 ) -> Result:
-    if evaluator.check_semantic_collision(scene_id, current_obj):
+    collided, _ = evaluator.check_semantic_collision(scene_id, current_obj)
+    if collided:
         return Result.SEMANTIC_COLLISION
 
     if called_found:
@@ -523,6 +522,7 @@ def main() -> None:
     writer = None
     poses = []
     result = Result.FAILURE_OOT
+    tau_history: List[float] = []   # τ per step for YOLO-CP
 
     try:
         for step in range(evaluator.max_steps):
@@ -537,6 +537,14 @@ def main() -> None:
             path = evaluator.actor.mapper.path
             chosen_detection = evaluator.actor.mapper.chosen_detection
 
+            # Compute active navigable map once per step (avoids repeated get_obstacle_mask() / dilate calls)
+            active_nav = (
+                evaluator.actor.mapper.get_active_navigable_map()
+                if hasattr(evaluator.actor.mapper, "get_active_navigable_map")
+                else evaluator.actor.mapper.one_map.navigable_map
+            )
+            map_shape = active_nav.shape
+
             rgb_panel = build_rgb_panel(
                 observations["rgb"],
                 [
@@ -547,7 +555,7 @@ def main() -> None:
                     f"yaw: {yaw:.2f}",
                 ],
             )
-            obstacle_panel = build_obstacle_panel(evaluator.actor.mapper)
+            obstacle_panel = build_obstacle_panel(active_nav)
             obstacle_title = (
                 "Semantic-Inflated Navigable Map + A*"
                 if getattr(evaluator.actor.mapper, "use_clip_semantic_nav_map", False)
@@ -555,7 +563,7 @@ def main() -> None:
             )
             obstacle_panel = draw_path_robot_goal(
                 obstacle_panel,
-                evaluator.actor.mapper,
+                map_shape,
                 robot_px,
                 path,
                 chosen_detection,
@@ -570,7 +578,7 @@ def main() -> None:
             )
             semantic_panel = draw_path_robot_goal(
                 semantic_panel,
-                evaluator.actor.mapper,
+                map_shape,
                 robot_px,
                 path,
                 chosen_detection,
@@ -589,7 +597,7 @@ def main() -> None:
             )
             gt_semantic_panel = draw_path_robot_goal(
                 gt_semantic_panel,
-                evaluator.actor.mapper,
+                map_shape,
                 robot_px,
                 path,
                 chosen_detection,
@@ -601,19 +609,30 @@ def main() -> None:
                 max_items=15,
             )
 
-            if getattr(evaluator.actor.mapper, "use_yolo_obstacle_map", False):
-                yolo_panel = build_yolo_obstacle_panel(
-                    evaluator.actor.mapper, evaluator, episode.scene_id, current_obj
-                )
-                yolo_panel = draw_path_robot_goal(
-                    yolo_panel,
-                    evaluator.actor.mapper,
+            yolo_cp_map = getattr(evaluator.actor.mapper, "yolo_cp_obstacle_map", None)
+            if yolo_cp_map is not None and getattr(evaluator.actor.mapper, "use_yolo_cp_obstacle_map", False):
+                from eval.semantic_collision import metric_to_px as _metric_to_px
+                _cell_size = evaluator.mapping.size / evaluator.mapping.n_points
+                _rx = -observations["state"].position[2]
+                _ry = -observations["state"].position[0]
+                _rpx, _rpy = _metric_to_px(_rx, _ry, evaluator.mapping.n_points, _cell_size)
+                _cd = evaluator.get_semantic_collision_data(episode.scene_id, current_obj)
+                yolo_cp_map.calibrate_with_gt(_cd.label_map, _cd.labels, _rpx, _rpy, yaw)
+                tau_history.append(yolo_cp_map.threshold)
+
+            use_yolo = getattr(evaluator.actor.mapper, "use_yolo_obstacle_map", False)
+            use_cp = getattr(evaluator.actor.mapper, "use_yolo_cp_obstacle_map", False)
+            if use_yolo or use_cp:
+                layers_panel = build_obstacle_layers_panel(evaluator.actor.mapper)
+                layers_panel = draw_path_robot_goal(
+                    layers_panel,
+                    map_shape,
                     robot_px,
                     path,
                     chosen_detection,
-                    "YOLO Obstacle Map (orange=seed, red=dilated, green=GT)",
+                    "Obstacle Layers (grey=depth, red=YOLO, purple=YOLO-CP)",
                 )
-                frame = np.concatenate([rgb_panel, yolo_panel, semantic_panel, gt_semantic_panel], axis=1)
+                frame = np.concatenate([rgb_panel, layers_panel, semantic_panel, gt_semantic_panel], axis=1)
             else:
                 frame = np.concatenate([rgb_panel, obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
 
@@ -631,7 +650,8 @@ def main() -> None:
 
             evaluator.execute_action(action)
 
-            if evaluator.check_semantic_collision(episode.scene_id, current_obj):
+            collided, _ = evaluator.check_semantic_collision(episode.scene_id, current_obj)
+            if collided:
                 result = Result.SEMANTIC_COLLISION
                 break
 
@@ -653,6 +673,29 @@ def main() -> None:
     print(f"Episode: {episode.episode_id}")
     print(f"Query: {current_obj}")
     print(f"Result: {result.name}")
+
+    if tau_history:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(10, 3))
+            ax.plot(tau_history, color="steelblue", linewidth=1.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel("τ (YOLO-CP threshold)")
+            ax.set_title(f"CP threshold τ over episode  |  ep={episode.episode_id}  query={current_obj}  result={result.name}")
+            ax.set_ylim(0.0, 1.05)
+            ax.axhline(tau_history[0], color="grey", linestyle="--", linewidth=0.8, label=f"init τ={tau_history[0]:.2f}")
+            ax.axhline(tau_history[-1], color="coral", linestyle="--", linewidth=0.8, label=f"final τ={tau_history[-1]:.3f}")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            tau_path = out_path.with_suffix(".tau_curve.png")
+            fig.tight_layout()
+            fig.savefig(str(tau_path), dpi=120)
+            plt.close(fig)
+            print(f"Saved τ curve to: {tau_path}")
+        except Exception as e:
+            print(f"Warning: could not save τ curve: {e}")
 
     # Save GT semantic collision map as annotated PNG
     collision_data = evaluator.get_semantic_collision_data(episode.scene_id, current_obj)

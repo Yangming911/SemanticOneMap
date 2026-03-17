@@ -8,10 +8,10 @@ EvalConf:
   log_rerun: False
   use_pointnav: False
   square_im: True
-  results_path: "results/minival_baseline/"
+  results_path: "results/minival_yolocp/"
 
 config: [
-  ./controller_habitat.yaml, # Default Habitat Controller
-  ./mapping_conf_sim_noyolo.yaml,  # yolo=F baseline
-  ./planning_conf.yaml       # Default Planning Configuration
+  ./controller_habitat.yaml,
+  ./mapping_conf_sim_yolocp.yaml,  # yolo=T + yolo-cp (GT calibration)
+  ./planning_conf.yaml
 ]

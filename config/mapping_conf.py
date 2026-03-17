@@ -1,3 +1,4 @@
+from typing import Optional
 from spock import spock
 
 @spock
@@ -31,4 +32,9 @@ class MappingConf:
     clip_cp_use_oacp: bool
     clip_cp_target_coverage: float
     clip_cp_window_size: int
+    use_yolo_cp_obstacle_map: Optional[bool] = False
+    yolo_cp_threshold: Optional[float] = 0.5
+    yolo_cp_target_coverage: Optional[float] = 0.9
+    yolo_cp_window_size: Optional[int] = 200
+    yolo_cp_frustum_max_depth: Optional[float] = 5.0
 

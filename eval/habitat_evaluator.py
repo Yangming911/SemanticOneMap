@@ -421,6 +421,21 @@ class HabitatEvaluator:
                     #         observations["depth"].max() - observations["depth"].min())))
                     self.logger.log_pos(cam_x, cam_y)
                 action, called_found = self.actor.act(observations)
+
+                yolo_cp_map = getattr(self.actor.mapper, "yolo_cp_obstacle_map", None)
+                if yolo_cp_map is not None and getattr(self.actor.mapper, "use_yolo_cp_obstacle_map", False):
+                    collision_data = self.get_semantic_collision_data(episode.scene_id, current_obj)
+                    cell_size = self.mapping.size / self.mapping.n_points
+                    robot_x = -observations['state'].position[2]
+                    robot_y = -observations['state'].position[0]
+                    robot_px, robot_py = metric_to_px(robot_x, robot_y, self.mapping.n_points, cell_size)
+                    yolo_cp_map.calibrate_with_gt(
+                        collision_data.label_map,
+                        collision_data.labels,
+                        robot_px, robot_py,
+                        yaw,
+                    )
+
                 self.execute_action(action)
                 if self.log_rerun:
                     self.logger.log_map()

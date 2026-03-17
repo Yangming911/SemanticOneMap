@@ -22,6 +22,7 @@ from mapping.semantic_navigable_map import SemanticNavigableMapUpdater, build_se
 from mapping.semantic_debug import SemanticPredGTCollector
 from mapping.yolo_obstacle_map import YOLOObstacleMap
 from mapping.clip_cp_obstacle_map import CLIPCPObstacleMap
+from mapping.yolo_cp_obstacle_map import YOLOCPObstacleMap
 
 # numpy
 import numpy as np
@@ -193,6 +194,19 @@ class Navigator:
             )
             self.clip_cp_obstacle_map.set_text_features(_cp_text_feats, _cp_labels, _cp_radii)
 
+        self.use_yolo_cp_obstacle_map = bool(getattr(config.mapping, "use_yolo_cp_obstacle_map", False))
+        self.yolo_cp_obstacle_map: YOLOCPObstacleMap = None
+        if self.use_yolo_cp_obstacle_map:
+            self.yolo_cp_obstacle_map = YOLOCPObstacleMap(
+                n_cells=self.one_map.n_cells,
+                cell_size=self.one_map.cell_size,
+                hfov_deg=90.0,
+                max_depth=float(getattr(config.mapping, "yolo_cp_frustum_max_depth", 5.0)),
+                threshold=float(getattr(config.mapping, "yolo_cp_threshold", 0.5)),
+                target_coverage=float(getattr(config.mapping, "yolo_cp_target_coverage", 0.9)),
+                window_size=int(getattr(config.mapping, "yolo_cp_window_size", 200)),
+            )
+
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
         self.previous_sims = None
@@ -271,6 +285,8 @@ class Navigator:
             self.yolo_obstacle_map.reset()
         if self.use_clip_cp_obstacle_map and self.clip_cp_obstacle_map is not None:
             self.clip_cp_obstacle_map.reset()
+        if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
+            self.yolo_cp_obstacle_map.reset()
         self.navigation_scores = np.zeros_like(self.semantic_navigable_map, dtype=np.float32)
         self.first_obs = True
         self.cyclic_checker = CyclicChecker()
@@ -318,6 +334,8 @@ class Navigator:
             base = self.yolo_obstacle_map.apply_to_navigable_map(base)
         if self.use_clip_cp_obstacle_map and self.clip_cp_obstacle_map is not None:
             base = self.clip_cp_obstacle_map.apply_to_navigable_map(base)
+        if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
+            base = self.yolo_cp_obstacle_map.apply_to_navigable_map(base)
         return base
 
     @torch.no_grad()
@@ -634,14 +652,22 @@ class Navigator:
         # detections = self.detector.detect(np.flip(image.transpose(1, 2, 0), axis=-1))
         img_hwc = image.transpose(1, 2, 0)
         detections = self.detector.detect(img_hwc)
-        if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None and \
-                hasattr(self.detector, "get_obstacle_detections") and self.one_map.camera_initialized:
-            obstacle_dets = self.detector.get_obstacle_detections()
-            self.yolo_obstacle_map.update(
-                obstacle_dets, depth, odometry,
-                self.one_map.fx, self.one_map.fy, self.one_map.cx, self.one_map.cy,
-                img_hwc.shape[0], img_hwc.shape[1],
-            )
+        if self.one_map.camera_initialized and hasattr(self.detector, "get_obstacle_detections"):
+            if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
+                obstacle_dets = self.detector.get_obstacle_detections()
+                self.yolo_obstacle_map.update(
+                    obstacle_dets, depth, odometry,
+                    self.one_map.fx, self.one_map.fy, self.one_map.cx, self.one_map.cy,
+                    img_hwc.shape[0], img_hwc.shape[1],
+                )
+            if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None and \
+                    hasattr(self.detector, "get_obstacle_detections_with_conf"):
+                dets_with_conf = self.detector.get_obstacle_detections_with_conf()
+                self.yolo_cp_obstacle_map.update(
+                    dets_with_conf, depth, odometry,
+                    self.one_map.fx, self.one_map.fy, self.one_map.cx, self.one_map.cy,
+                    img_hwc.shape[0], img_hwc.shape[1],
+                )
         a = time.time()
         image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
         b = time.time()

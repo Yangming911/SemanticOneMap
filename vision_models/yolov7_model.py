@@ -108,6 +108,7 @@ class YOLOv7Detector:
 
         # Cache all detections grouped by class name (all detected COCO classes)
         obstacle_detections: dict = {}
+        obstacle_confs: dict = {}
 
         for i in range(pred.shape[0]):
             class_name = COCO_CLASSES[int(pred[i, 5])]
@@ -115,6 +116,7 @@ class YOLOv7Detector:
             if box[0].item() == box[2].item() or box[1].item() == box[3].item():
                 continue
             box_list = [box[0].item(), box[1].item(), box[2].item(), box[3].item()]
+            conf = float(logits[i])
 
             if class_name == self.classes[0]:
                 preds["boxes"].append(box_list)
@@ -122,9 +124,12 @@ class YOLOv7Detector:
 
             if class_name not in obstacle_detections:
                 obstacle_detections[class_name] = []
+                obstacle_confs[class_name] = []
             obstacle_detections[class_name].append(box_list)
+            obstacle_confs[class_name].append(conf)
 
         self._last_obstacle_detections = obstacle_detections
+        self._last_obstacle_confs = obstacle_confs
         # print(f"YOLO forward: {time.time() - a}")
         return preds
 
@@ -135,6 +140,18 @@ class YOLOv7Detector:
             dict {class_name: [[x1, y1, x2, y2], ...]} for all classes_oi.
         """
         return self._last_obstacle_detections
+
+    def get_obstacle_detections_with_conf(self) -> dict:
+        """Return cached obstacle detections with confidence scores.
+
+        Returns:
+            dict {class_name: [(box, conf), ...]} where box=[x1,y1,x2,y2], conf=float.
+        """
+        result = {}
+        for class_name, boxes in self._last_obstacle_detections.items():
+            confs = self._last_obstacle_confs.get(class_name, [0.0] * len(boxes))
+            result[class_name] = list(zip(boxes, confs))
+        return result
 
 if __name__ == "__main__":
     start = torch.cuda.Event(enable_timing=True)
