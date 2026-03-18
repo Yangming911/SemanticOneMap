@@ -132,6 +132,12 @@ class OneMap:
 
         self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
 
+        # GCLIP feature map for obstacle detection (initialized lazily by Navigator)
+        self.gclip_feature_dim = 0
+        self.feature_map_gclip = None
+        self.confidence_map_gclip = None
+        self.updated_mask_gclip = None
+
         self.fx = None
         self.fy = None
         self.cx = None
@@ -194,9 +200,142 @@ class OneMap:
         # Reset updated mask
         self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
 
+        # Reset GCLIP maps if initialized
+        if self.feature_map_gclip is not None:
+            self.feature_map_gclip.zero_()
+            self.confidence_map_gclip.zero_()
+            self.updated_mask_gclip.zero_()
+            self.min_depth_map_gclip.fill_(float('inf'))
+
         # Reset iteration counter
         self._iters = 0
         self.agent_height_0 = None
+
+    def init_gclip_map(self, gclip_feature_dim: int):
+        """Initialize GCLIP feature map for dual-model obstacle detection."""
+        self.gclip_feature_dim = gclip_feature_dim
+        self.feature_map_gclip = torch.zeros(
+            (self.n_cells, self.n_cells, gclip_feature_dim), dtype=torch.float32
+        ).to(self.map_device)
+        self.confidence_map_gclip = torch.zeros(
+            (self.n_cells, self.n_cells), dtype=torch.float32
+        ).to(self.map_device)
+        self.updated_mask_gclip = torch.zeros(
+            (self.n_cells, self.n_cells), dtype=torch.bool
+        ).to(self.map_device)
+        # Min-depth map: closest depth seen so far per cell (min-depth aggregation)
+        self.min_depth_map_gclip = torch.full(
+            (self.n_cells, self.n_cells), float('inf'), dtype=torch.float32
+        ).to(self.map_device)
+
+    @torch.no_grad()
+    def update_gclip(self,
+                     values: torch.Tensor,
+                     depth: np.ndarray,
+                     tf_camera_to_episodic: np.ndarray,
+                     ) -> None:
+        """Update GCLIP feature map using min-depth aggregation.
+
+        For each grid cell, stores the feature from the closest-range observation.
+        Closer observations are more likely to be frontal/direct views of surfaces,
+        preserving semantic signal that averaging would destroy.
+
+        Args:
+            values: [D, Hf, Wf] GCLIP features from current frame
+            depth: [H, W] depth image
+            tf_camera_to_episodic: [4,4] camera-to-world transform
+        """
+        if self.feature_map_gclip is None:
+            return
+        assert values.shape[0] == self.gclip_feature_dim
+        if not self.camera_initialized:
+            return
+
+        depth_t = torch.tensor(depth, dtype=torch.float32, device="cuda")
+        h, w = depth_t.shape
+
+        # 1. Interpolate GCLIP features [D,Hf,Wf] → [H*W, D]
+        values_up = torch.nn.functional.interpolate(
+            values.unsqueeze(0), size=(h, w), mode='bilinear', align_corners=False
+        ).squeeze(0).permute(1, 2, 0).reshape(-1, self.gclip_feature_dim)
+
+        # 2. Back-project depth → 3D → world
+        projected_depth, _ = self.project_depth_camera(
+            depth_t, (h, w), self.fx, self.fy, self.cx, self.cy
+        )
+        tf = torch.tensor(tf_camera_to_episodic, dtype=torch.float32, device="cuda")
+        rotated_pcl = rotate_pcl(projected_depth, tf)
+        cam_x, cam_y = tf[:2, 3] / tf[3, 3]
+        rotated_pcl[:, :2] += torch.tensor([cam_x, cam_y], device="cuda")
+
+        # 3. Map to 2D grid indices
+        pcl_grid_ids = torch.floor(rotated_pcl[:, :2] / self.cell_size).to(torch.int32)
+        pcl_grid_ids[:, 0] += self.map_center_cells[0]
+        pcl_grid_ids[:, 1] += self.map_center_cells[1]
+
+        # 4. Valid pixel mask: finite depth + in-bounds
+        depth_flat = depth_t.flatten()
+        valid = ((depth_flat > 0) & (depth_flat != float('inf')) &
+                 (pcl_grid_ids[:, 0] >= 0) & (pcl_grid_ids[:, 0] < self.n_cells) &
+                 (pcl_grid_ids[:, 1] >= 0) & (pcl_grid_ids[:, 1] < self.n_cells))
+        if not valid.any():
+            self.updated_mask_gclip.zero_()
+            return
+
+        gx = pcl_grid_ids[valid, 0].long()
+        gy = pcl_grid_ids[valid, 1].long()
+        feats = values_up[valid]           # [M, D]
+        depths_valid = depth_flat[valid]   # [M]
+
+        # 5. Per-cell min-depth aggregation
+        cell_ids = gx * self.n_cells + gy  # [M] linear index
+        unique_ids, inverse = cell_ids.unique(return_inverse=True)
+        n_unique = unique_ids.shape[0]
+
+        # Find minimum depth per unique cell in this frame
+        frame_min_depth = torch.full((n_unique,), float('inf'), device="cuda")
+        frame_min_depth.scatter_reduce_(0, inverse, depths_valid,
+                                        reduce="amin", include_self=True)
+
+        # Select pixels that achieve the min depth for their cell
+        is_min = (depths_valid == frame_min_depth[inverse])  # [M]
+        min_inv = inverse[is_min]   # indices into unique_ids [K']
+        min_feats = feats[is_min]   # [K', D]
+
+        # Keep exactly one feature per unique cell (sort by cell id, keep first)
+        sort_order = min_inv.argsort()
+        min_inv_s = min_inv[sort_order]
+        min_feats_s = min_feats[sort_order]
+        keep = torch.ones(min_inv_s.shape[0], dtype=torch.bool, device="cuda")
+        if min_inv_s.shape[0] > 1:
+            keep[1:] = min_inv_s[1:] != min_inv_s[:-1]
+        final_inv = min_inv_s[keep]     # [n_unique], index into unique_ids
+        final_feats = min_feats_s[keep] # [n_unique, D]
+        final_depths = frame_min_depth[final_inv]  # min depth per cell
+
+        # Move to CPU for indexing (map stored on map_device=cpu)
+        ux = (unique_ids[final_inv] // self.n_cells).to(self.map_device)
+        uy = (unique_ids[final_inv] % self.n_cells).to(self.map_device)
+        final_depths_cpu = final_depths.to(self.map_device)
+        final_feats_cpu = final_feats.to(self.map_device)
+
+        # 6. Only update cells where this frame's min depth < historical min depth
+        stored_min = self.min_depth_map_gclip[ux, uy]
+        should_update = final_depths_cpu < stored_min
+
+        if not should_update.any():
+            self.updated_mask_gclip.zero_()
+            return
+
+        ux_up = ux[should_update]
+        uy_up = uy[should_update]
+        self.feature_map_gclip[ux_up, uy_up] = final_feats_cpu[should_update]
+        self.min_depth_map_gclip[ux_up, uy_up] = final_depths_cpu[should_update]
+        self.confidence_map_gclip[ux_up, uy_up] += 1.0
+
+        # Updated mask: cells that actually changed this frame
+        self.updated_mask_gclip.zero_()
+        self.updated_mask_gclip[ux_up, uy_up] = True
 
     def reset_updated_mask(self):
         self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
@@ -485,11 +624,12 @@ class OneMap:
         kernels = compute_gaussian_kernel_components(self.kernel_components, depth_noise[mapping].reshape(-1,
                                                                                   self.kernel_size, self.kernel_size))
 
-        coalesced_map_data = torch.zeros((all_ids.shape[1], self.feature_dim), dtype=torch.float32, device="cuda")
+        _feat_dim = new_map.shape[-1]  # infer from input, supports both ConvNeXt (768) and GCLIP (512)
+        coalesced_map_data = torch.zeros((all_ids.shape[1], _feat_dim), dtype=torch.float32, device="cuda")
         coalesced_scores = torch.zeros((all_ids.shape[1], 1), dtype=torch.float32, device="cuda")
         # Compute the blurred map and blurred scores
         coalesced_map_data.index_add_(0, mapping, (kernels.unsqueeze(-1) *
-                                                   new_map.unsqueeze(1).unsqueeze(1)).reshape(-1, self.feature_dim))
+                                                   new_map.unsqueeze(1).unsqueeze(1)).reshape(-1, _feat_dim))
         coalesced_scores.index_add_(0, mapping, (kernels * scores_mapped.unsqueeze(1)).reshape(-1, 1))
 
         # Free up memory to avoid OOM
@@ -508,7 +648,7 @@ class OneMap:
         #     self.n_cells, self.n_cells, new_map.values().shape[0] * self.feature_dim,
         #                                 new_map.element_size() * new_map.values().shape[
         #                                     0] * self.feature_dim / 1024 / 1024))
-        return torch.sparse_coo_tensor(all_ids, coalesced_scores, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu(), torch.sparse_coo_tensor(all_ids, coalesced_map_data, (self.n_cells, self.n_cells, self.feature_dim), is_coalesced=True).cpu(), obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu()
+        return torch.sparse_coo_tensor(all_ids, coalesced_scores, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu(), torch.sparse_coo_tensor(all_ids, coalesced_map_data, (self.n_cells, self.n_cells, _feat_dim), is_coalesced=True).cpu(), obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu()
 
     def project_single(self,
                        values: torch.Tensor,

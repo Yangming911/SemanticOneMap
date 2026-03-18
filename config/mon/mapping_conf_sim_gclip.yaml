@@ -1,4 +1,4 @@
-MappingConf: # [all in feature_map.py]
+MappingConf: # Dual-model: ConvNeXt for navigation + GCLIP for obstacle CP
   n_points: 600  # Number of grid cells per dim
   size: 60 # in meters, size of the map per dim
   agent_radius: 0.2  # in meters
@@ -15,19 +15,14 @@ MappingConf: # [all in feature_map.py]
   filter_stairs: True
   floor_level: -0.88
   floor_threshold: -1.1
-  clip_model_type: convnext  # convnext or gclip (navigation backbone)
-  use_gclip_for_obstacles: False  # dual-model: add GCLIP for obstacle CP
+  clip_model_type: convnext  # Navigation backbone stays ConvNeXt
+  use_gclip_for_obstacles: True  # Add GCLIP for obstacle CP
   use_clip_semantic_nav_map: False
   clip_semantic_sim_threshold: 0.0
-  use_yolo_obstacle_map: True
+  use_yolo_obstacle_map: False
   yolo_window_size: 50
-  use_clip_cp_obstacle_map: False
+  use_clip_cp_obstacle_map: True  # Enable CLIP CP with GCLIP features
   clip_cp_threshold: 0.05
   clip_cp_use_oacp: False
   clip_cp_target_coverage: 0.9
   clip_cp_window_size: 100
-  use_yolo_cp_obstacle_map: False
-  yolo_cp_threshold: 0.5
-  yolo_cp_target_coverage: 0.9
-  yolo_cp_window_size: 200
-  yolo_cp_frustum_max_depth: 5.0

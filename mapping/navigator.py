@@ -151,6 +151,16 @@ class Navigator:
         self.sam_predictor = SamPredictor(self.sam)
 
         self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
+
+        # Dual-model: GCLIP for obstacle detection (separate from navigation model)
+        self.use_gclip_for_obstacles = bool(getattr(config.mapping, "use_gclip_for_obstacles", False))
+        self.gclip_model = None
+        if self.use_gclip_for_obstacles:
+            from vision_models.gclip_dense import GCLIPModel
+            self.gclip_model = GCLIPModel(clip_input_size=640)
+            self.gclip_model.eval()
+            self.one_map.init_gclip_map(self.gclip_model.feature_dim)
+
         self.use_clip_semantic_nav_map = bool(getattr(config.mapping, "use_clip_semantic_nav_map", False))
         self.clip_semantic_sim_threshold = float(getattr(config.mapping, "clip_semantic_sim_threshold", 0.0))
         self.semantic_label_config = None
@@ -175,24 +185,44 @@ class Navigator:
                 window_size=window_size,
             )
 
+        self.use_clip_argmax_obstacle_map = bool(getattr(config.mapping, "use_clip_argmax_obstacle_map", False))
         self.use_clip_cp_obstacle_map = bool(getattr(config.mapping, "use_clip_cp_obstacle_map", False))
         self.clip_cp_obstacle_map: CLIPCPObstacleMap = None
-        if self.use_clip_cp_obstacle_map:
-            from eval.semantic_collision import _SEMANTIC_SAFETY_RADIUS_CELLS
+        if self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map:
+            from eval.semantic_collision import _SEMANTIC_SAFETY_RADIUS_CELLS, _NON_OBSTACLE_LABELS, _OUTDOOR_COCO_LABELS
+            from vision_models.coco_classes import COCO_CLASSES
             _cp_labels = list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())
             _cp_radii = [_SEMANTIC_SAFETY_RADIUS_CELLS[l] for l in _cp_labels]
-            _cp_text_feats = self.model.get_text_features(
+            # Use GCLIP text features for obstacle CP if dual-model enabled
+            _cp_feat_model = self.gclip_model if self.gclip_model is not None else self.model
+            _cp_text_feats = _cp_feat_model.get_text_features(
                 [f"a {l}" for l in _cp_labels]
             ).to(self.one_map.map_device)
+            # Argmax mode: pass COCO + NON_OBSTACLE as background competitors
+            # CP mode: no background labels, use threshold/OACP instead
+            _bg_text_feats = None
+            if self.use_clip_argmax_obstacle_map:
+                _obs_set = set(_cp_labels)
+                _bg_labels = [l for l in list(COCO_CLASSES) + list(_NON_OBSTACLE_LABELS)
+                              if l not in _obs_set and l not in _OUTDOOR_COCO_LABELS]
+                _bg_text_feats = _cp_feat_model.get_text_features(
+                    [f"a {l}" for l in _bg_labels]
+                ).to(self.one_map.map_device)
             self.clip_cp_obstacle_map = CLIPCPObstacleMap(
                 n_cells=self.one_map.n_cells,
                 cell_size=self.one_map.cell_size,
                 threshold=float(getattr(config.mapping, "clip_cp_threshold", 0.05)),
                 use_oacp=bool(getattr(config.mapping, "clip_cp_use_oacp", False)),
                 target_coverage=float(getattr(config.mapping, "clip_cp_target_coverage", 0.9)),
-                window_size=int(getattr(config.mapping, "clip_cp_window_size", 100)),
+                window_size=int(getattr(config.mapping, "clip_cp_window_size", 200)),
+                gamma=float(getattr(config.mapping, "clip_cp_gamma", 0.05)),
+                initial_alpha=float(getattr(config.mapping, "clip_cp_initial_alpha", 0.5)),
             )
-            self.clip_cp_obstacle_map.set_text_features(_cp_text_feats, _cp_labels, _cp_radii)
+            self.clip_cp_obstacle_map.set_text_features(
+                _cp_text_feats, _cp_labels, _cp_radii,
+                bg_text_features=_bg_text_feats,
+                bg_labels=_bg_labels if self.use_clip_argmax_obstacle_map else None,
+            )
 
         self.use_yolo_cp_obstacle_map = bool(getattr(config.mapping, "use_yolo_cp_obstacle_map", False))
         self.yolo_cp_obstacle_map: YOLOCPObstacleMap = None
@@ -231,6 +261,10 @@ class Navigator:
         self.path = None
         self.is_spot = type(config.controller) == SpotControllerConf
         self.initializing = True
+
+        # GT label map for ACI calibration (simulation only)
+        self._gt_label_map: np.ndarray = None   # [n_cells, n_cells], 0=bg, 1+=obstacle
+        self._gt_labels: List[str] = []          # label_idx-1 → label name
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
 
@@ -283,7 +317,7 @@ class Navigator:
         self.semantic_navigable_map = self.one_map.navigable_map.copy()
         if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
             self.yolo_obstacle_map.reset()
-        if self.use_clip_cp_obstacle_map and self.clip_cp_obstacle_map is not None:
+        if (self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map) and self.clip_cp_obstacle_map is not None:
             self.clip_cp_obstacle_map.reset()
         if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
             self.yolo_cp_obstacle_map.reset()
@@ -300,6 +334,16 @@ class Navigator:
                           camera_matrix: np.ndarray
                           ) -> None:
         self.one_map.set_camera_matrix(camera_matrix)
+
+    def set_gt_label_map(self, label_map: np.ndarray, labels: List[str]) -> None:
+        """Set GT semantic label map for ACI calibration (simulation only).
+
+        Args:
+            label_map: [n_cells, n_cells] uint16 array; 0=background, k=labels[k-1].
+            labels: list of obstacle label strings (0-indexed, so labels[k-1] for value k).
+        """
+        self._gt_label_map = label_map
+        self._gt_labels = labels
 
     def set_query(self,
                   txt: List[str]
@@ -332,7 +376,7 @@ class Navigator:
             base = self.one_map.navigable_map
         if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
             base = self.yolo_obstacle_map.apply_to_navigable_map(base)
-        if self.use_clip_cp_obstacle_map and self.clip_cp_obstacle_map is not None:
+        if (self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map) and self.clip_cp_obstacle_map is not None:
             base = self.clip_cp_obstacle_map.apply_to_navigable_map(base)
         if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
             base = self.yolo_cp_obstacle_map.apply_to_navigable_map(base)
@@ -673,15 +717,49 @@ class Navigator:
         b = time.time()
         self.one_map.update(image_features, depth, odometry, self.artificial_obstacles)
         self._update_semantic_navigable_map()
-        if self.use_clip_cp_obstacle_map and self.clip_cp_obstacle_map is not None:
-            self.clip_cp_obstacle_map.update(
-                self.one_map.updated_mask, self.one_map.feature_map
-            )
-            # OACP calibration: for each YOLO-projected cell, record (CLIP_feat, label)
+
+        # GCLIP dual-model: extract GCLIP features and update separate feature map
+        if self.gclip_model is not None:
+            gclip_features = self.gclip_model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+            self.one_map.update_gclip(gclip_features, depth, odometry)
+
+        # CLIP CP obstacle map: use GCLIP features if available, else ConvNeXt
+        if (self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map) and self.clip_cp_obstacle_map is not None:
+            if self.gclip_model is not None:
+                _cp_mask = self.one_map.updated_mask_gclip
+                _cp_feats = self.one_map.feature_map_gclip
+            else:
+                _cp_mask = self.one_map.updated_mask
+                _cp_feats = self.one_map.feature_map
+            self.clip_cp_obstacle_map.update(_cp_mask, _cp_feats)
+            # OACP ACI calibration: use GT labels of near-field cells (simulation)
+            if (self.clip_cp_obstacle_map.use_oacp
+                    and self._gt_label_map is not None):
+                delta_cells = max(1, int(1.0 / self.one_map.cell_size))
+                x0 = max(0, px - delta_cells)
+                x1 = min(self.one_map.n_cells, px + delta_cells + 1)
+                y0 = max(0, py - delta_cells)
+                y1 = min(self.one_map.n_cells, py + delta_cells + 1)
+                region = self._gt_label_map[x0:x1, y0:y1]
+                if region.any():
+                    conf_map = (self.one_map.confidence_map_gclip
+                                if self.gclip_model is not None
+                                else self.one_map.confidence_map)
+                    xs, ys = np.nonzero(region)
+                    for dx, dy in zip(xs, ys):
+                        cx, cy = x0 + dx, y0 + dy
+                        if conf_map[cx, cy] < 1:
+                            continue  # cell not yet observed
+                        lbl_idx = int(region[dx, dy])
+                        true_label = self._gt_labels[lbl_idx - 1]
+                        self.clip_cp_obstacle_map.calibrate_aci(
+                            _cp_feats[cx, cy, :], true_label
+                        )
+            # Legacy OACP calibration via YOLO detections
             if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
                 for label, px, py in self.yolo_obstacle_map.latest_projected:
                     self.clip_cp_obstacle_map.calibrate(
-                        self.one_map.feature_map[px, py, :], label
+                        _cp_feats[px, py, :], label
                     )
         c = time.time()
         self.get_map(False)

@@ -27,11 +27,19 @@ class MappingConf:
     clip_semantic_sim_threshold: float
     use_yolo_obstacle_map: bool
     yolo_window_size: int
-    use_clip_cp_obstacle_map: bool
-    clip_cp_threshold: float
-    clip_cp_use_oacp: bool
-    clip_cp_target_coverage: float
-    clip_cp_window_size: int
+    clip_model_type: Optional[str] = "convnext"
+    use_gclip_for_obstacles: Optional[bool] = False
+    # CLIP obstacle map — two modes (mutually exclusive):
+    #   use_clip_argmax_obstacle_map: pure argmax over COCO+NON_OBSTACLE vs obstacle labels, no CP params needed
+    #   use_clip_cp_obstacle_map:     threshold / OACP mode, requires clip_cp_* params below
+    use_clip_argmax_obstacle_map: Optional[bool] = False
+    use_clip_cp_obstacle_map: Optional[bool] = False
+    clip_cp_threshold: Optional[float] = 0.05
+    clip_cp_use_oacp: Optional[bool] = False
+    clip_cp_target_coverage: Optional[float] = 0.9
+    clip_cp_window_size: Optional[int] = 200
+    clip_cp_gamma: Optional[float] = 0.05
+    clip_cp_initial_alpha: Optional[float] = 0.5
     use_yolo_cp_obstacle_map: Optional[bool] = False
     yolo_cp_threshold: Optional[float] = 0.5
     yolo_cp_target_coverage: Optional[float] = 0.9

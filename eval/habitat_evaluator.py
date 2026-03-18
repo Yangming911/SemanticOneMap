@@ -182,8 +182,11 @@ class HabitatEvaluator:
         self.debug_collector.set_gt_map(gt_seed_map, gt_labels)
         self.yolo_debug_collector.set_gt_map(gt_seed_map, gt_labels)
 
-    def get_semantic_collision_data(self, scene_id: str, query_label: str):
-        cache_key = (scene_id, query_label)
+    def get_semantic_collision_data(self, scene_id: str, query_label: str,
+                                     floor_y: float = None):
+        # floor_y is per-episode (robot may be on different floors in same scene)
+        floor_y_key = round(floor_y, 1) if floor_y is not None else None
+        cache_key = (scene_id, query_label, floor_y_key)
         if cache_key not in self.semantic_collision_cache:
             cell_size = self.mapping.size / self.mapping.n_points
             max_query_radius_cells = int(self.planner.max_detect_distance / cell_size)
@@ -194,12 +197,14 @@ class HabitatEvaluator:
                 self.is_gibson,
                 query_label,
                 max_query_radius_cells,
+                floor_y=floor_y,
             )
         return self.semantic_collision_cache[cache_key]
 
     def check_semantic_collision(self, scene_id: str, query_label: str):
         """Return (collided: bool, causing_label: str | None)."""
-        collision_data = self.get_semantic_collision_data(scene_id, query_label)
+        floor_y = getattr(self, "_episode_floor_y", None)
+        collision_data = self.get_semantic_collision_data(scene_id, query_label, floor_y=floor_y)
         position = self.sim.get_agent(0).get_state().position
         x = -position[2]
         y = -position[0]
@@ -378,7 +383,12 @@ class HabitatEvaluator:
             else:
                 obj_count[current_obj] += 1
             self.actor.set_query(current_obj)
-            self.get_semantic_collision_data(episode.scene_id, current_obj)
+            # floor_y: agent start_position[1] IS the floor Y in world coords
+            # (floor_level=-0.88 is camera-frame offset, not world offset)
+            self._episode_floor_y = float(episode.start_position[1])
+            gt_cd = self.get_semantic_collision_data(episode.scene_id, current_obj,
+                                                     floor_y=self._episode_floor_y)
+            self.actor.mapper.set_gt_label_map(gt_cd.label_map, gt_cd.labels)
             if self.log_rerun:
                 pts = []
                 for obj in self.scene_data[episode.scene_id].object_locations[current_obj]:
@@ -424,7 +434,8 @@ class HabitatEvaluator:
 
                 yolo_cp_map = getattr(self.actor.mapper, "yolo_cp_obstacle_map", None)
                 if yolo_cp_map is not None and getattr(self.actor.mapper, "use_yolo_cp_obstacle_map", False):
-                    collision_data = self.get_semantic_collision_data(episode.scene_id, current_obj)
+                    collision_data = self.get_semantic_collision_data(episode.scene_id, current_obj,
+                                                                       floor_y=self._episode_floor_y)
                     cell_size = self.mapping.size / self.mapping.n_points
                     robot_x = -observations['state'].position[2]
                     robot_y = -observations['state'].position[0]

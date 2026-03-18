@@ -12,22 +12,57 @@ _SEMANTIC_LABEL_ALIASES = {
     "monitor": "tv",
     "plant": "potted plant",
     "potted plant": "potted plant",
+    "flower pot": "potted plant",
+    "flowerpot": "potted plant",
+    "decorative plant": "potted plant",
     "diningtable": "dining table",
     "coffee table": "dining table",
     "sofa": "couch",
+    "bath towel": "towel",
+    "hand towel": "towel",
+    "cushion": "pillow",
+    # lamp aliases → "lamp"
+    "floor lamp": "lamp",
+    "table lamp": "lamp",
+    "desk lamp": "lamp",
+    "lamp table": "lamp",
+    "lamps": "lamp",
+    "lamp ceiling": "lamp",
+    "lamp desk": "lamp",
+    "台灯": "lamp",
+    "落地灯": "lamp",
+    "floor light": "lamp",
+    "standing lamp": "lamp",
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    # Production dict: only classes where YOLO dilated precision > 50%
-    # chair: 95.6% precision (1374 detections in analysis run)
-    # toilet: 83.0% precision (235 detections)
-    # potted plant: 54.5% precision (kept as supplementary)
-    "chair": 4,
+    # Selected by GCLIP nonconformity d-prime analysis (d' > 1.5):
+    # potted plant: d' ≈ +2.22  (ep=1, n=139)
+    # toilet:       d' ≈ +2.72  (ep=0, n=10)
+    # pillow:       d' ≈ +2.27  (ep=0, n=30)
+    # towel:        d' ≈ +1.89  (ep=0, n=15)
+    # chair removed: d' = -1.45 (ep=6, n=970) — GCLIP cannot discriminate
     "potted plant": 3,
     "toilet": 3,
+    "pillow": 2,
+    "towel": 2,
+    "lamp": 2,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1
+
+# COCO classes that never appear indoors — excluded from argmax background competitors
+_OUTDOOR_COCO_LABELS = frozenset({
+    # vehicles
+    "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    # street furniture
+    "traffic light", "fire hydrant", "stop sign", "parking meter",
+    # large outdoor animals
+    "bird", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+    # outdoor sports equipment
+    "frisbee", "skis", "snowboard", "kite", "skateboard", "surfboard",
+    "baseball bat", "baseball glove", "tennis racket", "sports ball",
+})
 
 _NON_OBSTACLE_LABELS = frozenset({
     # 建筑结构
@@ -83,7 +118,18 @@ def get_semantic_safety_radius_cells(
     return max(int(radius), 0)
 
 
-def _iter_object_metric_points(objects: Sequence, is_gibson: bool) -> Iterable[Tuple[float, float]]:
+# Height thresholds relative to floor_y:
+#   bottom must be within 0.3 m above floor (not elevated on shelves)
+#   centre must be within 1.5 m above floor (not hanging/wall-mounted)
+_MAX_BOTTOM_ABOVE_FLOOR = 0.3
+_MAX_CENTER_ABOVE_FLOOR = 1.5
+
+
+def _iter_object_metric_points(
+    objects: Sequence,
+    is_gibson: bool,
+    floor_y: Optional[float] = None,
+) -> Iterable[Tuple[float, float]]:
     for obj in objects:
         if is_gibson:
             points = np.asarray(obj, dtype=np.float32)
@@ -98,6 +144,20 @@ def _iter_object_metric_points(objects: Sequence, is_gibson: bool) -> Iterable[T
         center = np.asarray(obj.bbox.center, dtype=np.float32)
         if center.shape[0] < 3:
             continue
+
+        # Height filter relative to this episode's floor Y.
+        # Skips objects on shelves, hanging on walls, mounted too high, etc.
+        if floor_y is not None:
+            try:
+                sizes = np.asarray(obj.bbox.sizes, dtype=np.float32)
+                bottom_y = float(center[1]) - float(sizes[1]) / 2.0
+                if (bottom_y - floor_y) > _MAX_BOTTOM_ABOVE_FLOOR:
+                    continue
+            except Exception:
+                pass
+            if (float(center[1]) - floor_y) > _MAX_CENTER_ABOVE_FLOOR:
+                continue
+
         yield float(-center[2]), float(-center[0])
 
 
@@ -106,6 +166,7 @@ def _build_label_seed_map(
     n_cells: int,
     cell_size: float,
     is_gibson: bool,
+    floor_y: Optional[float] = None,
 ) -> Tuple[np.ndarray, List[str]]:
     labels: List[str] = []
     label_to_idx: Dict[str, int] = {}
@@ -120,7 +181,7 @@ def _build_label_seed_map(
             labels.append(label)
         label_idx = label_to_idx[label]
 
-        for x, y in _iter_object_metric_points(objects, is_gibson):
+        for x, y in _iter_object_metric_points(objects, is_gibson, floor_y=floor_y):
             px, py = metric_to_px(x, y, n_cells=n_cells, cell_size=cell_size)
             if 0 <= px < n_cells and 0 <= py < n_cells:
                 seed_map[px, py] = label_idx
@@ -142,9 +203,11 @@ def build_semantic_collision_data(
     is_gibson: bool,
     query_label: str,
     max_query_radius_cells: int,
+    floor_y: Optional[float] = None,
 ) -> SemanticCollisionData:
     cell_size = size / float(n_cells)
-    seed_map, labels = _build_label_seed_map(object_locations, n_cells, cell_size, is_gibson)
+    seed_map, labels = _build_label_seed_map(object_locations, n_cells, cell_size, is_gibson,
+                                              floor_y=floor_y)
 
     collision_map = np.zeros((n_cells, n_cells), dtype=bool)
     label_map = np.zeros((n_cells, n_cells), dtype=np.uint16)

@@ -16,6 +16,7 @@ from config import load_eval_config
 from eval import get_closest_dist
 from eval.actor import MONActor
 from eval.habitat_evaluator import HabitatEvaluator, Result
+from eval.semantic_collision import _SEMANTIC_SAFETY_RADIUS_CELLS
 from vision_models.coco_classes import COCO_CLASSES
 
 
@@ -45,6 +46,13 @@ DISTINCT_BRG_COLORS = [
     (255, 160, 122),
     (127, 255, 212),
 ]
+
+# Fixed label→BGR color mapping for obstacle labels (shared by semantic_map and argmax_map)
+_OBSTACLE_LABELS_CANONICAL = list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())
+_OBSTACLE_LABEL_COLOR = {
+    label: DISTINCT_BRG_COLORS[i % len(DISTINCT_BRG_COLORS)]
+    for i, label in enumerate(_OBSTACLE_LABELS_CANONICAL)
+}
 
 
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
@@ -188,17 +196,29 @@ def path_to_display(path: List[np.ndarray], map_shape: Tuple[int, int], panel_si
 
 
 def build_palette(labels: List[str]) -> np.ndarray:
-    colors = []
-    for idx in range(len(labels)):
-        if idx < len(DISTINCT_BRG_COLORS):
-            colors.append(DISTINCT_BRG_COLORS[idx])
-            continue
+    """Build a BGR color palette for the given labels.
 
-        hue = (idx * 0.618033988749895) % 1.0
-        sat = [0.95, 0.8, 0.65][idx % 3]
-        val = [1.0, 0.9, 0.8][(idx // 3) % 3]
-        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-        colors.append((int(b * 255), int(g * 255), int(r * 255)))
+    Obstacle labels (in _OBSTACLE_LABEL_COLOR) always get their canonical fixed
+    color so that semantic_map and argmax_map are visually consistent.
+    """
+    colors = []
+    fallback_idx = 0
+    for label in labels:
+        if label in _OBSTACLE_LABEL_COLOR:
+            colors.append(_OBSTACLE_LABEL_COLOR[label])
+        else:
+            # Cycle through DISTINCT colors for non-obstacle labels
+            while fallback_idx < len(DISTINCT_BRG_COLORS) and DISTINCT_BRG_COLORS[fallback_idx] in _OBSTACLE_LABEL_COLOR.values():
+                fallback_idx += 1
+            if fallback_idx < len(DISTINCT_BRG_COLORS):
+                colors.append(DISTINCT_BRG_COLORS[fallback_idx])
+                fallback_idx += 1
+            else:
+                hue = (len(colors) * 0.618033988749895) % 1.0
+                sat = [0.95, 0.8, 0.65][len(colors) % 3]
+                val = [1.0, 0.9, 0.8][(len(colors) // 3) % 3]
+                r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+                colors.append((int(b * 255), int(g * 255), int(r * 255)))
 
     return np.asarray(colors, dtype=np.uint8)
 
@@ -236,8 +256,105 @@ def build_semantic_panel(
     return cv2.resize(oriented, (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
 
 
+@torch.no_grad()
+def build_gclip_sim_panel(
+    mapper,
+    obstacle_labels: List[str],
+    panel_size: int = PANEL_SIZE,
+) -> Tuple[np.ndarray, dict]:
+    """Build a heatmap of max GCLIP cosine similarity to obstacle labels.
+
+    Returns (panel_bgr, stats_dict).
+    stats_dict keys: fg_mean, fg_std, bg_mean, bg_std, n_explored, threshold_suggestion
+    """
+    n_cells = mapper.one_map.n_cells
+    stats = {}
+    blank = np.zeros((n_cells, n_cells, 3), dtype=np.uint8)
+
+    gclip_feat = getattr(mapper.one_map, "feature_map_gclip", None)
+    gclip_conf = getattr(mapper.one_map, "confidence_map_gclip", None)
+    if gclip_feat is None or gclip_conf is None:
+        return cv2.resize(orient_xy_map(blank), (panel_size, panel_size), interpolation=cv2.INTER_NEAREST), stats
+
+    explored = gclip_conf > 0
+    if int(explored.sum().item()) == 0:
+        return cv2.resize(orient_xy_map(blank), (panel_size, panel_size), interpolation=cv2.INTER_NEAREST), stats
+
+    # Get GCLIP text features for obstacle labels
+    gclip_model = getattr(mapper, "gclip_model", None)
+    if gclip_model is None:
+        return cv2.resize(orient_xy_map(blank), (panel_size, panel_size), interpolation=cv2.INTER_NEAREST), stats
+
+    text_feats = gclip_model.get_text_features(
+        [f"a {lbl}" for lbl in obstacle_labels]
+    ).to(gclip_feat.device)
+
+    feats = gclip_feat[explored]  # [M, 512]
+    import torch.nn.functional as F
+    feats_norm = F.normalize(feats, dim=1)
+    sims = feats_norm @ text_feats.T  # [M, N_labels]
+    max_sims, _ = sims.max(dim=1)  # [M]
+    max_sims_np = max_sims.cpu().numpy()
+
+    # Build heatmap: map sim values to color
+    sim_map = np.zeros((n_cells, n_cells), dtype=np.float32)
+    coords = torch.nonzero(explored, as_tuple=False).cpu().numpy()
+    sim_map[coords[:, 0], coords[:, 1]] = max_sims_np
+
+    # Use depth obstacle map as fg/bg proxy
+    nav_map = mapper.one_map.navigable_map.astype(bool)
+    explored_np = explored.cpu().numpy()
+    fg_mask = explored_np & (~nav_map)  # obstacle cells (depth-based)
+    bg_mask = explored_np & nav_map     # free cells
+
+    fg_sims = sim_map[fg_mask] if fg_mask.any() else np.array([])
+    bg_sims = sim_map[bg_mask] if bg_mask.any() else np.array([])
+
+    stats["n_explored"] = int(explored.sum().item())
+    if len(fg_sims) > 0:
+        stats["fg_mean"] = float(np.mean(fg_sims))
+        stats["fg_std"] = float(np.std(fg_sims))
+        stats["fg_median"] = float(np.median(fg_sims))
+    if len(bg_sims) > 0:
+        stats["bg_mean"] = float(np.mean(bg_sims))
+        stats["bg_std"] = float(np.std(bg_sims))
+        stats["bg_median"] = float(np.median(bg_sims))
+    if len(fg_sims) > 0 and len(bg_sims) > 0:
+        # Suggest τ = bg_mean + 1*bg_std (conservative)
+        stats["tau_bg_1sigma"] = float(np.mean(bg_sims) + np.std(bg_sims))
+        stats["tau_bg_2sigma"] = float(np.mean(bg_sims) + 2 * np.std(bg_sims))
+        # d-prime
+        pooled_std = np.sqrt((np.std(fg_sims)**2 + np.std(bg_sims)**2) / 2)
+        if pooled_std > 1e-8:
+            stats["d_prime"] = float((np.mean(fg_sims) - np.mean(bg_sims)) / pooled_std)
+
+    # Colorize: auto-scale to actual sim range for spatial contrast
+    explored_sims = sim_map[explored_np]
+    vmin = float(explored_sims.min()) - 0.002
+    vmax = float(explored_sims.max()) + 0.002
+    sim_clipped = np.clip(sim_map, vmin, vmax)
+    sim_normalized = ((sim_clipped - vmin) / (vmax - vmin) * 255).astype(np.uint8)
+    heatmap = cv2.applyColorMap(sim_normalized, cv2.COLORMAP_JET)
+    # Black out unexplored
+    heatmap[~explored_np] = 0
+
+    oriented = orient_xy_map(heatmap)
+    panel = cv2.resize(oriented, (panel_size, panel_size), interpolation=cv2.INTER_NEAREST)
+
+    # Overlay stats text
+    y = 28
+    for key in ["fg_mean", "fg_std", "bg_mean", "bg_std", "d_prime", "tau_bg_1sigma"]:
+        if key in stats:
+            txt = f"{key}: {stats[key]:.4f}"
+            cv2.putText(panel, txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 20
+
+    return panel, stats
+
+
 def build_ground_truth_semantic_panel(evaluator: HabitatEvaluator, scene_id: str, query_label: str) -> np.ndarray:
-    collision_data = evaluator.get_semantic_collision_data(scene_id, query_label)
+    collision_data = evaluator.get_semantic_collision_data(
+        scene_id, query_label, floor_y=getattr(evaluator, "_episode_floor_y", None))
     panel = np.zeros((evaluator.mapping.n_points, evaluator.mapping.n_points, 3), dtype=np.uint8)
     if collision_data.labels:
         palette = build_palette(collision_data.labels)
@@ -278,6 +395,15 @@ def build_obstacle_layers_panel(mapper) -> np.ndarray:
         # Show conf seeds: any cell where max conf across classes ≥ τ
         cp_seeds = (yolo_cp_map._conf_map.max(axis=2) >= yolo_cp_map.threshold)
         panel[cp_seeds & base_nav] = (255, 200, 0)    # YOLO-CP seeds → cyan/yellow
+
+    clip_cp_map = getattr(mapper, "clip_cp_obstacle_map", None)
+    use_clip_cp = (getattr(mapper, "use_clip_cp_obstacle_map", False) or
+                   getattr(mapper, "use_clip_argmax_obstacle_map", False))
+    if clip_cp_map is not None and use_clip_cp:
+        cp_mask = clip_cp_map.get_obstacle_mask()
+        panel[cp_mask & base_nav] = (180, 0, 180)     # CLIP-CP dilated → purple
+        cp_seeds = (clip_cp_map._seed_map > 0)
+        panel[cp_seeds & base_nav] = (255, 200, 0)    # CLIP-CP seeds → yellow
 
     return cv2.resize(orient_xy_map(panel), (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
 
@@ -504,7 +630,13 @@ def main() -> None:
 
     current_obj = episode.obj_sequence[0]
     evaluator.actor.set_query(current_obj)
-    ground_truth_collision_data = evaluator.get_semantic_collision_data(episode.scene_id, current_obj)
+    evaluator._episode_floor_y = float(episode.start_position[1])
+    ground_truth_collision_data = evaluator.get_semantic_collision_data(
+        episode.scene_id, current_obj, floor_y=evaluator._episode_floor_y)
+    # Pass GT label map to navigator for ACI calibration
+    evaluator.actor.mapper.set_gt_label_map(
+        ground_truth_collision_data.label_map, ground_truth_collision_data.labels
+    )
     semantic_labels = resolve_semantic_labels(
         evaluator,
         episode,
@@ -616,13 +748,34 @@ def main() -> None:
                 _rx = -observations["state"].position[2]
                 _ry = -observations["state"].position[0]
                 _rpx, _rpy = _metric_to_px(_rx, _ry, evaluator.mapping.n_points, _cell_size)
-                _cd = evaluator.get_semantic_collision_data(episode.scene_id, current_obj)
+                _cd = evaluator.get_semantic_collision_data(episode.scene_id, current_obj, floor_y=getattr(evaluator, "_episode_floor_y", None))
                 yolo_cp_map.calibrate_with_gt(_cd.label_map, _cd.labels, _rpx, _rpy, yaw)
                 tau_history.append(yolo_cp_map.threshold)
 
             use_yolo = getattr(evaluator.actor.mapper, "use_yolo_obstacle_map", False)
             use_cp = getattr(evaluator.actor.mapper, "use_yolo_cp_obstacle_map", False)
-            if use_yolo or use_cp:
+            use_clip_cp = (getattr(evaluator.actor.mapper, "use_clip_cp_obstacle_map", False) or
+                           getattr(evaluator.actor.mapper, "use_clip_argmax_obstacle_map", False))
+            has_gclip = getattr(evaluator.actor.mapper, "gclip_model", None) is not None
+
+            # Build GCLIP similarity heatmap panel if dual-model active
+            gclip_panel = None
+            if has_gclip:
+                _obs_labels = ["chair", "potted plant", "toilet"]
+                gclip_panel, gclip_stats = build_gclip_sim_panel(
+                    evaluator.actor.mapper, _obs_labels
+                )
+                gclip_panel = draw_path_robot_goal(
+                    gclip_panel, map_shape, robot_px, path,
+                    chosen_detection, "GCLIP Obstacle Sim Heatmap",
+                )
+                # Collect stats for end-of-episode summary
+                if step == 0:
+                    all_gclip_stats = []
+                if gclip_stats:
+                    all_gclip_stats.append(gclip_stats)
+
+            if use_yolo or use_cp or use_clip_cp:
                 layers_panel = build_obstacle_layers_panel(evaluator.actor.mapper)
                 layers_panel = draw_path_robot_goal(
                     layers_panel,
@@ -630,9 +783,20 @@ def main() -> None:
                     robot_px,
                     path,
                     chosen_detection,
-                    "Obstacle Layers (grey=depth, red=YOLO, purple=YOLO-CP)",
+                    "Obstacle Layers (grey=depth, purple=CLIP-CP)",
                 )
-                frame = np.concatenate([rgb_panel, layers_panel, semantic_panel, gt_semantic_panel], axis=1)
+                if gclip_panel is not None:
+                    # 2 rows: top=[rgb, layers, gclip_sim], bottom=[obstacle, semantic, gt]
+                    top_row = np.concatenate([rgb_panel, layers_panel, gclip_panel], axis=1)
+                    bottom_row = np.concatenate([obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
+                    frame = np.concatenate([top_row, bottom_row], axis=0)
+                else:
+                    frame = np.concatenate([rgb_panel, layers_panel, semantic_panel, gt_semantic_panel], axis=1)
+            elif gclip_panel is not None:
+                # No CP layers but GCLIP is active — show gclip sim panel
+                top_row = np.concatenate([rgb_panel, obstacle_panel, gclip_panel], axis=1)
+                bottom_row = np.concatenate([np.zeros_like(rgb_panel), semantic_panel, gt_semantic_panel], axis=1)
+                frame = np.concatenate([top_row, bottom_row], axis=0)
             else:
                 frame = np.concatenate([rgb_panel, obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
 
@@ -674,6 +838,120 @@ def main() -> None:
     print(f"Query: {current_obj}")
     print(f"Result: {result.name}")
 
+    # Print and save GCLIP sim distribution
+    if 'all_gclip_stats' in dir() and all_gclip_stats:
+        final_stats = all_gclip_stats[-1]
+        print("\n=== GCLIP Obstacle Similarity Stats (final step) ===")
+        for k, v in final_stats.items():
+            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+        # Save histogram using GT semantic labels for proper fg/bg
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import torch.nn.functional as _F
+
+            mapper = evaluator.actor.mapper
+            gclip_feat = mapper.one_map.feature_map_gclip
+            gclip_conf = mapper.one_map.confidence_map_gclip
+            if gclip_feat is not None and gclip_conf is not None:
+                explored = gclip_conf > 0
+                if explored.any():
+                    _obs_labels = ["chair", "potted plant", "toilet"]
+                    text_feats = mapper.gclip_model.get_text_features(
+                        [f"a {l}" for l in _obs_labels]
+                    ).to(gclip_feat.device)
+                    feats = gclip_feat[explored]
+                    feats_n = _F.normalize(feats, dim=1)
+                    sims = feats_n @ text_feats.T  # [M, N_labels]
+                    max_sims = sims.max(dim=1)[0].cpu().numpy()
+                    per_label_sims = sims.cpu().numpy()  # [M, N_labels]
+
+                    explored_np = explored.cpu().numpy()
+                    coords = torch.nonzero(explored, as_tuple=False).cpu().numpy()
+
+                    # Use GT semantic collision map for true fg/bg
+                    gt_collision = evaluator.get_semantic_collision_data(episode.scene_id, current_obj, floor_y=getattr(evaluator, "_episode_floor_y", None))
+                    gt_label_map = gt_collision.label_map  # [n, n] with 0=bg, 1+=obstacle class
+                    gt_fg = gt_label_map > 0  # true semantic obstacle cells
+                    gt_bg = (gt_label_map == 0) & explored_np  # explored non-obstacle cells
+
+                    fg_indices = gt_fg[coords[:, 0], coords[:, 1]]
+                    bg_indices = gt_bg[coords[:, 0], coords[:, 1]]
+
+                    print(f"\n=== GCLIP Stats with GT fg/bg ===")
+                    if fg_indices.any():
+                        fg_sims = max_sims[fg_indices]
+                        print(f"  GT_FG: n={fg_indices.sum()}, mean={fg_sims.mean():.4f}, std={fg_sims.std():.4f}, median={np.median(fg_sims):.4f}")
+                    if bg_indices.any():
+                        bg_sims = max_sims[bg_indices]
+                        print(f"  GT_BG: n={bg_indices.sum()}, mean={bg_sims.mean():.4f}, std={bg_sims.std():.4f}, median={np.median(bg_sims):.4f}")
+                    if fg_indices.any() and bg_indices.any():
+                        pooled = np.sqrt((fg_sims.std()**2 + bg_sims.std()**2) / 2)
+                        if pooled > 1e-8:
+                            dp = (fg_sims.mean() - bg_sims.mean()) / pooled
+                            print(f"  d-prime (GT): {dp:.4f}")
+                        tau_1s = bg_sims.mean() + bg_sims.std()
+                        tau_2s = bg_sims.mean() + 2 * bg_sims.std()
+                        print(f"  tau_bg+1sigma: {tau_1s:.4f}")
+                        print(f"  tau_bg+2sigma: {tau_2s:.4f}")
+
+                    # Per-label breakdown
+                    for j, lbl in enumerate(_obs_labels):
+                        label_sims = per_label_sims[:, j]
+                        # GT cells for this specific label
+                        if lbl in gt_collision.labels:
+                            gt_idx = gt_collision.labels.index(lbl) + 1
+                            lbl_fg = (gt_label_map == gt_idx)
+                            lbl_fg_indices = lbl_fg[coords[:, 0], coords[:, 1]]
+                            if lbl_fg_indices.any():
+                                lbl_fg_sims = label_sims[lbl_fg_indices]
+                                lbl_bg_sims = label_sims[bg_indices]
+                                print(f"  [{lbl}] GT_FG: n={lbl_fg_indices.sum()}, sim mean={lbl_fg_sims.mean():.4f}±{lbl_fg_sims.std():.4f} | BG mean={lbl_bg_sims.mean():.4f}±{lbl_bg_sims.std():.4f}")
+
+                    # Plot: 2 subplots - depth-proxy vs GT
+                    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+                    bins = np.linspace(-0.05, 0.45, 80)
+
+                    # Left: depth-based (old, for reference)
+                    nav_map = mapper.one_map.navigable_map.astype(bool)
+                    depth_fg = explored_np & (~nav_map)
+                    depth_bg = explored_np & nav_map
+                    dfg_idx = depth_fg[coords[:, 0], coords[:, 1]]
+                    dbg_idx = depth_bg[coords[:, 0], coords[:, 1]]
+                    ax = axes[0]
+                    if dbg_idx.any():
+                        ax.hist(max_sims[dbg_idx], bins=bins, alpha=0.6, label=f"BG-depth (n={dbg_idx.sum()})", color="steelblue")
+                    if dfg_idx.any():
+                        ax.hist(max_sims[dfg_idx], bins=bins, alpha=0.6, label=f"FG-depth (n={dfg_idx.sum()})", color="coral")
+                    ax.set_title("Depth-based fg/bg (noisy)")
+                    ax.set_xlabel("Max cosine sim")
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+
+                    # Right: GT-based
+                    ax = axes[1]
+                    if bg_indices.any():
+                        ax.hist(max_sims[bg_indices], bins=bins, alpha=0.6, label=f"BG-GT (n={bg_indices.sum()})", color="steelblue")
+                    if fg_indices.any():
+                        ax.hist(max_sims[fg_indices], bins=bins, alpha=0.6, label=f"FG-GT (n={fg_indices.sum()})", color="coral")
+                    if fg_indices.any() and bg_indices.any():
+                        ax.axvline(tau_1s, color="green", linestyle="--", label=f"bg+1σ={tau_1s:.3f}")
+                        ax.axvline(tau_2s, color="orange", linestyle="--", label=f"bg+2σ={tau_2s:.3f}")
+                    ax.set_title(f"GT semantic fg/bg | d'={dp:.2f}" if fg_indices.any() and bg_indices.any() else "GT semantic fg/bg")
+                    ax.set_xlabel("Max cosine sim")
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+
+                    fig.suptitle(f"GCLIP Obstacle Sim | ep={episode.episode_id} query={current_obj} result={result.name}")
+                    hist_path = out_path.with_suffix(".gclip_sim_hist.png")
+                    fig.tight_layout()
+                    fig.savefig(str(hist_path), dpi=120)
+                    plt.close(fig)
+                    print(f"Saved GCLIP sim histogram to: {hist_path}")
+        except Exception as e:
+            print(f"Warning: could not save GCLIP histogram: {e}")
+
     if tau_history:
         try:
             import matplotlib
@@ -698,7 +976,7 @@ def main() -> None:
             print(f"Warning: could not save τ curve: {e}")
 
     # Save GT semantic collision map as annotated PNG
-    collision_data = evaluator.get_semantic_collision_data(episode.scene_id, current_obj)
+    collision_data = evaluator.get_semantic_collision_data(episode.scene_id, current_obj, floor_y=getattr(evaluator, "_episode_floor_y", None))
     map_img = build_ground_truth_semantic_panel(evaluator, episode.scene_id, current_obj)
     scale = 3
     map_img = cv2.resize(map_img, (PANEL_SIZE * scale, PANEL_SIZE * scale), interpolation=cv2.INTER_NEAREST)
@@ -716,6 +994,80 @@ def main() -> None:
     map_path = out_path.with_suffix(".semantic_map.png")
     cv2.imwrite(str(map_path), annotated)
     print(f"Saved semantic map to: {map_path}")
+
+    # Save GCLIP argmax label map (per-cell predicted obstacle label)
+    mapper = evaluator.actor.mapper
+    clip_cp_map = getattr(mapper, "clip_cp_obstacle_map", None)
+    use_argmax = getattr(mapper, "use_clip_argmax_obstacle_map", False)
+    if clip_cp_map is not None and use_argmax:
+        obs_labels = _OBSTACLE_LABELS_CANONICAL  # same order as _SEMANTIC_SAFETY_RADIUS_CELLS
+        n_cells = clip_cp_map.n_cells
+        argmax_img = np.zeros((n_cells, n_cells, 3), dtype=np.uint8)
+        seed_map = clip_cp_map._seed_map  # 0=bg, 1..N=obstacle label idx+1
+        nav_np = mapper.one_map.navigable_map.astype(bool) if hasattr(mapper.one_map.navigable_map, 'astype') else np.array(mapper.one_map.navigable_map, dtype=bool)
+        argmax_img[nav_np & (seed_map == 0)] = (50, 50, 50)  # explored free → dark gray
+        for j, lbl in enumerate(obs_labels):
+            seed = (seed_map == j + 1).astype(np.uint8)
+            if seed.max() == 0:
+                continue
+            color = _OBSTACLE_LABEL_COLOR[lbl]
+            kernel = clip_cp_map._kernels[j] if j < len(clip_cp_map._kernels) else None
+            if kernel is not None:
+                dilated = cv2.dilate(seed, kernel, iterations=1).astype(bool)
+            else:
+                dilated = seed.astype(bool)
+            argmax_img[dilated] = color
+        argmax_img = cv2.resize(orient_xy_map(argmax_img),
+                                (PANEL_SIZE * scale, PANEL_SIZE * scale),
+                                interpolation=cv2.INTER_NEAREST)
+        # Build legend (only labels that appear in seed_map)
+        present_labels = [lbl for j, lbl in enumerate(obs_labels) if (seed_map == j + 1).any()]
+        legend2 = np.zeros((legend_h, legend_w, 3), dtype=np.uint8)
+        for i, lbl in enumerate(present_labels):
+            y_pos = 20 + i * row_h
+            color = _OBSTACLE_LABEL_COLOR[lbl]
+            cv2.rectangle(legend2, (10, y_pos - 16), (36, y_pos + 8), color, -1)
+            cv2.putText(legend2, lbl, (44, y_pos + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+        argmax_annotated = np.concatenate([argmax_img, legend2[:argmax_img.shape[0]]], axis=1)
+        argmax_path = out_path.with_suffix(".gclip_argmax_map.png")
+        cv2.imwrite(str(argmax_path), argmax_annotated)
+        print(f"Saved GCLIP argmax label map to: {argmax_path}")
+
+        # Cross-table: for each GT label, what did argmax predict at those cells?
+        pred_label_names = ["bg"] + list(obs_labels)
+        gt_labels_list = collision_data.labels  # labels[k-1] for gt_label_map value k
+        gt_label_map = collision_data.label_map
+        bg_winner_map = getattr(clip_cp_map, "_bg_winner_map", None)
+        bg_label_names = getattr(clip_cp_map, "_bg_labels", [])
+        print("\n--- GT vs GCLIP-argmax cross-table (GT rows, argmax cols) ---")
+        header = "GT \\ Pred"
+        print(f"{header:<20}", end="")
+        for pname in pred_label_names:
+            print(f"{pname[:12]:>14}", end="")
+        print()
+        for gt_idx, gt_lbl in enumerate(gt_labels_list, start=1):
+            gt_mask = (gt_label_map == gt_idx)
+            if not gt_mask.any():
+                continue
+            print(f"{gt_lbl:<20}", end="")
+            for pred_idx in range(len(pred_label_names)):
+                count = int((seed_map[gt_mask] == pred_idx).sum())
+                print(f"{count:>14}", end="")
+            print(f"  | total={gt_mask.sum()}")
+            # Show top-5 winning bg labels at this GT position
+            if bg_winner_map is not None and bg_label_names:
+                bg_winners = bg_winner_map[gt_mask]
+                bg_winners = bg_winners[bg_winners > 0]  # exclude unobserved
+                if len(bg_winners) > 0:
+                    from collections import Counter as _Counter
+                    top = _Counter(bg_winners.tolist()).most_common(5)
+                    top_str = ", ".join(
+                        f"{bg_label_names[idx-1]}({cnt})"
+                        for idx, cnt in top
+                        if 0 < idx <= len(bg_label_names)
+                    )
+                    print(f"  -> top bg winners: {top_str}")
+        print("---")
 
 
 if __name__ == "__main__":
