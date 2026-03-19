@@ -11,6 +11,6 @@ EvalConf:
 
 config: [
   ./controller_habitat.yaml,
-  ./mapping_conf_baseline.yaml,
+  ./mapping_conf_gclip_cp.yaml,
   ./planning_conf.yaml
 ]

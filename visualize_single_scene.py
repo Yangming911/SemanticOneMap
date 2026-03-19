@@ -814,9 +814,11 @@ def main() -> None:
 
             evaluator.execute_action(action)
 
-            collided, _ = evaluator.check_semantic_collision(episode.scene_id, current_obj)
+            collided, cause_label = evaluator.check_semantic_collision(episode.scene_id, current_obj)
             if collided:
                 result = Result.SEMANTIC_COLLISION
+                position = evaluator.sim.get_agent(0).get_state().position
+                print(f"SEMANTIC_COLLISION at step={step} cause={cause_label} pos=({-position[2]:.2f}, {-position[0]:.2f}) world_y={position[1]:.2f}")
                 break
 
             if called_found:
@@ -1068,6 +1070,52 @@ def main() -> None:
                     )
                     print(f"  -> top bg winners: {top_str}")
         print("---")
+
+    # CP mode: nonconformity score analysis for GT FG cells
+    use_cp = getattr(mapper, "use_clip_cp_obstacle_map", False)
+    if clip_cp_map is not None and use_cp and not use_argmax:
+        # _last_obs_sims: saved per-cell max obstacle sim (need to add to clip_cp_map)
+        # Fallback: use feature_map_gclip to recompute sims for GT FG cells
+        gt_label_map = collision_data.label_map
+        gt_labels_list = collision_data.labels
+        feat_map = getattr(mapper.one_map, "feature_map_gclip", None)
+        text_feats = clip_cp_map._text_features  # [N_obs, F]
+        if feat_map is not None and text_feats is not None:
+            import torch, torch.nn.functional as F
+            print("\n--- CP nonconformity score analysis (GT FG cells) ---")
+            print("  nonconformity = 1 - max_j sim(cell, obstacle_label_j)")
+            feat_np = feat_map  # [n, n, F]
+            if hasattr(feat_np, 'cpu'):
+                feat_np = feat_np.cpu().numpy()
+            n = feat_np.shape[0]
+            flat = feat_np.reshape(-1, feat_np.shape[-1])  # [n*n, F]
+            flat_t = torch.from_numpy(flat).float()
+            norms = flat_t.norm(dim=1, keepdim=True)
+            observed = (norms.squeeze() > 1e-6)
+            flat_norm = F.normalize(flat_t, dim=1)
+            tf = text_feats.cpu().float()
+            sims = (flat_norm @ tf.T).numpy()  # [n*n, N_obs]
+            max_sims = sims.max(axis=1).reshape(n, n)  # best obstacle sim per cell
+
+            tau_now = clip_cp_map.threshold
+            print(f"  Current threshold τ = {tau_now:.4f}")
+            for gt_idx, gt_lbl in enumerate(gt_labels_list, start=1):
+                gt_mask = (gt_label_map == gt_idx)
+                if not gt_mask.any():
+                    continue
+                scores = max_sims[gt_mask]
+                scores = scores[scores > 1e-6]  # observed only
+                if len(scores) == 0:
+                    continue
+                nc_scores = 1.0 - scores  # nonconformity
+                covered = (scores >= tau_now).sum()
+                print(f"\n  [{gt_lbl}]  n={len(scores)}, covered@τ={covered}/{len(scores)} ({100*covered/len(scores):.0f}%)")
+                print(f"    sim: mean={scores.mean():.4f}  std={scores.std():.4f}  min={scores.min():.4f}  max={scores.max():.4f}")
+                print(f"    nc:  mean={nc_scores.mean():.4f}  std={nc_scores.std():.4f}")
+                for cov in [0.50, 0.75, 0.90, 0.95, 0.99]:
+                    tau_needed = float(np.quantile(scores, 1.0 - cov))
+                    print(f"    τ for {int(cov*100):2d}% coverage = {tau_needed:.4f}  (nc quantile = {1-tau_needed:.4f})")
+            print("---")
 
 
 if __name__ == "__main__":

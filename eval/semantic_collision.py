@@ -18,8 +18,6 @@ _SEMANTIC_LABEL_ALIASES = {
     "diningtable": "dining table",
     "coffee table": "dining table",
     "sofa": "couch",
-    "bath towel": "towel",
-    "hand towel": "towel",
     "cushion": "pillow",
     # lamp aliases → "lamp"
     "floor lamp": "lamp",
@@ -40,12 +38,11 @@ _SEMANTIC_SAFETY_RADIUS_CELLS = {
     # potted plant: d' ≈ +2.22  (ep=1, n=139)
     # toilet:       d' ≈ +2.72  (ep=0, n=10)
     # pillow:       d' ≈ +2.27  (ep=0, n=30)
-    # towel:        d' ≈ +1.89  (ep=0, n=15)
+    # towel removed: d' too low in navigation episodes (caused 4/6 false collisions)
     # chair removed: d' = -1.45 (ep=6, n=970) — GCLIP cannot discriminate
     "potted plant": 3,
     "toilet": 3,
     "pillow": 2,
-    "towel": 2,
     "lamp": 2,
 }
 
@@ -111,7 +108,7 @@ def get_semantic_safety_radius_cells(
     normalized_label = normalize_semantic_label(label)
     normalized_query = normalize_semantic_label(query_label)
     if normalized_label == normalized_query:
-        return 0
+        return -1  # navigation target → exclude from collision map entirely
     radius = _SEMANTIC_SAFETY_RADIUS_CELLS.get(normalized_label)
     if radius is None:
         return -1  # not in obstacle whitelist → treat as free space
@@ -218,6 +215,8 @@ def build_semantic_collision_data(
             continue
 
         radius_cells = get_semantic_safety_radius_cells(label, query_label, max_query_radius_cells)
+        if radius_cells < 0:
+            continue  # excluded (e.g. query label or not in whitelist)
         kernel = _make_disk_kernel(radius_cells)
         dilated = cv2.dilate(class_seed, kernel, iterations=1).astype(bool)
         collision_map |= dilated

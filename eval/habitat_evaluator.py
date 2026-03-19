@@ -523,6 +523,61 @@ class HabitatEvaluator:
             with open(f"{self.results_path}/state/state_{episode.episode_id}.txt", 'w') as f:
                 f.write(str(results[n_ep].value))
 
+            # GCLIP argmax: collect per-episode feature alignment stats
+            _clip_cp = getattr(self.actor.mapper, "clip_cp_obstacle_map", None)
+            if _clip_cp is not None and getattr(self.actor.mapper, "use_clip_argmax_obstacle_map", False):
+                try:
+                    import torch, torch.nn.functional as _F
+                    _feat_map = getattr(self.actor.mapper.one_map, "feature_map_gclip", None)
+                    _text_feats = _clip_cp._text_features  # [N_obs, F]
+                    _obs_labels = _clip_cp._labels
+                    _seed_map = _clip_cp._seed_map
+                    _gt_lm = gt_cd.label_map
+                    _gt_labels = gt_cd.labels
+                    if _feat_map is not None and _text_feats is not None:
+                        _fn = _feat_map if not hasattr(_feat_map, 'cpu') else _feat_map.cpu().numpy()
+                        _nc = self.actor.mapper.one_map.n_cells
+                        _flat = _fn.reshape(-1, _fn.shape[-1])
+                        _flat_t = torch.from_numpy(_flat).float()
+                        _norms = _flat_t.norm(dim=1)
+                        _obs_mask = (_seed_map.reshape(-1) > 0) & (_norms.numpy() > 1e-6)
+                        _nav_np = self.actor.mapper.one_map.navigable_map.astype(bool).reshape(-1)
+                        _conf_np = (_norms.numpy() > 1e-6)
+                        _free_mask = _nav_np & _conf_np & (_seed_map.reshape(-1) == 0)
+                        _rows = []
+                        for _mask, _cell_type in [(_obs_mask, "argmax_obstacle"), (_free_mask, "free")]:
+                            _idxs = np.where(_mask)[0]
+                            if len(_idxs) == 0:
+                                continue
+                            _rng = np.random.default_rng(42)
+                            _sample = _rng.choice(_idxs, size=min(20, len(_idxs)), replace=False)
+                            for _idx in _sample:
+                                _px, _py = int(_idx // _nc), int(_idx % _nc)
+                                _fv = _F.normalize(_flat_t[_idx:_idx+1], dim=1)
+                                _sims = (_fv @ _text_feats.cpu().float().T).squeeze(0).numpy()
+                                _pred_j = int(_seed_map.reshape(-1)[_idx]) - 1 if _seed_map.reshape(-1)[_idx] > 0 else -1
+                                _pred_lbl = _obs_labels[_pred_j] if _pred_j >= 0 else "bg"
+                                _gt_idx = int(_gt_lm[_px, _py])
+                                _gt_lbl = _gt_labels[_gt_idx - 1] if 0 < _gt_idx <= len(_gt_labels) else "bg"
+                                _sim_to_pred = float(_sims[_pred_j]) if _pred_j >= 0 else float(_sims.max())
+                                _gt_j = _obs_labels.index(_gt_lbl) if _gt_lbl in _obs_labels else -1
+                                _sim_to_gt = float(_sims[_gt_j]) if _gt_j >= 0 else float("nan")
+                                _rows.append({
+                                    "episode_id": episode.episode_id,
+                                    "cell_type": _cell_type,
+                                    "px": _px, "py": _py,
+                                    "pred_label": _pred_lbl,
+                                    "gt_label": _gt_lbl,
+                                    "sim_to_pred": _sim_to_pred,
+                                    "sim_to_gt": _sim_to_gt,
+                                    "sim_gap": _sim_to_pred - _sim_to_gt if not np.isnan(_sim_to_gt) else float("nan"),
+                                })
+                        if not hasattr(self, "_gclip_align_rows"):
+                            self._gclip_align_rows = []
+                        self._gclip_align_rows.extend(_rows)
+                except Exception as _e:
+                    print(f"Warning: GCLIP alignment collection failed ep={episode.episode_id}: {_e}")
+
         total_time = time.time() - eval_start
         from datetime import datetime
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -536,6 +591,13 @@ class HabitatEvaluator:
             w = csv.writer(f)
             w.writerow(["episode_id", "query_label", "cause_label"])
             w.writerows(collision_log)
+        if hasattr(self, "_gclip_align_rows") and self._gclip_align_rows:
+            align_csv = f"{self.results_path}/gclip_alignment_{_ts}.csv"
+            with open(align_csv, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["episode_id","cell_type","px","py","pred_label","gt_label","sim_to_pred","sim_to_gt","sim_gap"])
+                w.writeheader()
+                w.writerows(self._gclip_align_rows)
+            print(f"Saved GCLIP alignment CSV: {align_csv}")
         sr = success / n_eps if n_eps > 0 else 0.0
         spl = spl_accum / n_eps if n_eps > 0 else 0.0
         result_counts = {r: results.count(r) for r in Result}
