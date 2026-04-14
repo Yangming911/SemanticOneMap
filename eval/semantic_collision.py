@@ -31,19 +31,36 @@ _SEMANTIC_LABEL_ALIASES = {
     "落地灯": "lamp",
     "floor light": "lamp",
     "standing lamp": "lamp",
+    # MP3D category aliases
+    "tv_monitor": "tv",
+    "chest_of_drawers": "chest of drawers",
+    "dresser": "chest of drawers",
+    "gym_equipment": "gym equipment",
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    # Selected by GCLIP nonconformity d-prime analysis (d' > 1.5):
-    # potted plant: d' ≈ +2.22  (ep=1, n=139)
-    # toilet:       d' ≈ +2.72  (ep=0, n=10)
-    # pillow:       d' ≈ +2.27  (ep=0, n=30)
-    # towel removed: d' too low in navigation episodes (caused 4/6 false collisions)
-    # chair removed: d' = -1.45 (ep=6, n=970) — GCLIP cannot discriminate
+    # HM3D obstacles (GCLIP nonconformity d-prime analysis, d' > 1.5):
     "potted plant": 3,
     "toilet": 3,
     "pillow": 2,
     "lamp": 2,
+    # MP3D obstacles (21-category ObjectNav):
+    "bed": 3,
+    "sofa": 3,
+    "couch": 3,
+    "chest of drawers": 2,
+    "cabinet": 2,
+    "sink": 2,
+    "bathtub": 3,
+    "counter": 2,
+    "fireplace": 3,
+    "gym equipment": 3,
+    "stool": 2,
+    "tv": 2,
+    "shower": 2,
+    "cushion": 1,
+    "table": 2,
+    "chair": 1,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1
@@ -201,6 +218,7 @@ def build_semantic_collision_data(
     query_label: str,
     max_query_radius_cells: int,
     floor_y: Optional[float] = None,
+    oacp_radius_override: Optional[int] = None,
 ) -> SemanticCollisionData:
     cell_size = size / float(n_cells)
     seed_map, labels = _build_label_seed_map(object_locations, n_cells, cell_size, is_gibson,
@@ -214,9 +232,12 @@ def build_semantic_collision_data(
         if not class_seed.any():
             continue
 
-        radius_cells = get_semantic_safety_radius_cells(label, query_label, max_query_radius_cells)
-        if radius_cells < 0:
-            continue  # excluded (e.g. query label or not in whitelist)
+        if oacp_radius_override is not None:
+            radius_cells = oacp_radius_override
+        else:
+            radius_cells = get_semantic_safety_radius_cells(label, query_label, max_query_radius_cells)
+            if radius_cells < 0:
+                continue  # excluded (e.g. query label or not in whitelist)
         kernel = _make_disk_kernel(radius_cells)
         dilated = cv2.dilate(class_seed, kernel, iterations=1).astype(bool)
         collision_map |= dilated

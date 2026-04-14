@@ -32,6 +32,7 @@ from typing import List, Optional, Set, Any, Union
 
 # torch
 import torch
+import torch.nn.functional as F
 
 # warnings
 import warnings
@@ -159,7 +160,10 @@ class Navigator:
             from vision_models.gclip_dense import GCLIPModel
             self.gclip_model = GCLIPModel(clip_input_size=640)
             self.gclip_model.eval()
-            self.one_map.init_gclip_map(self.gclip_model.feature_dim)
+            self.one_map.init_gclip_map(
+                self.gclip_model.feature_dim,
+                aggregation=str(getattr(config.mapping, "clip_gclip_aggregation", "min_depth")),
+            )
 
         self.use_clip_semantic_nav_map = bool(getattr(config.mapping, "use_clip_semantic_nav_map", False))
         self.clip_semantic_sim_threshold = float(getattr(config.mapping, "clip_semantic_sim_threshold", 0.0))
@@ -187,21 +191,31 @@ class Navigator:
 
         self.use_clip_argmax_obstacle_map = bool(getattr(config.mapping, "use_clip_argmax_obstacle_map", False))
         self.use_clip_cp_obstacle_map = bool(getattr(config.mapping, "use_clip_cp_obstacle_map", False))
+        self._cp_goal_zone_disable = bool(getattr(config.mapping, "clip_cp_goal_zone_disable", True))
+        self._cp_step_guard = bool(getattr(config.mapping, "clip_cp_step_guard", False))
+        self._cp_step_guard_lookahead = int(getattr(config.mapping, "clip_cp_step_guard_lookahead", 3))
+        self._cp_detection_gate = bool(getattr(config.mapping, "clip_cp_detection_gate", False))
+        self._gclip_query_feat: Optional[torch.Tensor] = None  # GCLIP query embedding, set in set_query()
         self.clip_cp_obstacle_map: CLIPCPObstacleMap = None
         if self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map:
             from eval.semantic_collision import _SEMANTIC_SAFETY_RADIUS_CELLS, _NON_OBSTACLE_LABELS, _OUTDOOR_COCO_LABELS
             from vision_models.coco_classes import COCO_CLASSES
             _cp_labels = list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())
-            _cp_radii = [_SEMANTIC_SAFETY_RADIUS_CELLS[l] for l in _cp_labels]
+            _radius_scale = float(getattr(config.mapping, "clip_cp_safety_radius_scale", 1.0))
+            _radius_add = int(getattr(config.mapping, "clip_cp_safety_radius_add", 0))
+            _cp_radii = [max(1, int(round(_SEMANTIC_SAFETY_RADIUS_CELLS[l] * _radius_scale)) + _radius_add)
+                         for l in _cp_labels]
             # Use GCLIP text features for obstacle CP if dual-model enabled
             _cp_feat_model = self.gclip_model if self.gclip_model is not None else self.model
             _cp_text_feats = _cp_feat_model.get_text_features(
                 [f"a {l}" for l in _cp_labels]
             ).to(self.one_map.map_device)
             # Argmax mode: pass COCO + NON_OBSTACLE as background competitors
-            # CP mode: no background labels, use threshold/OACP instead
+            # Margin-OACP mode: also needs BG features for margin computation
+            _cp_use_margin = bool(getattr(config.mapping, "clip_cp_use_margin", False))
             _bg_text_feats = None
-            if self.use_clip_argmax_obstacle_map:
+            _bg_labels = []
+            if self.use_clip_argmax_obstacle_map or _cp_use_margin:
                 _obs_set = set(_cp_labels)
                 _bg_labels = [l for l in list(COCO_CLASSES) + list(_NON_OBSTACLE_LABELS)
                               if l not in _obs_set and l not in _OUTDOOR_COCO_LABELS]
@@ -217,11 +231,14 @@ class Navigator:
                 window_size=int(getattr(config.mapping, "clip_cp_window_size", 200)),
                 gamma=float(getattr(config.mapping, "clip_cp_gamma", 0.05)),
                 initial_alpha=float(getattr(config.mapping, "clip_cp_initial_alpha", 0.5)),
+                use_margin_score=_cp_use_margin,
+                max_seeds_per_label=int(getattr(config.mapping, "clip_cp_max_seeds_per_label", 0)),
+                temporal_persistence=int(getattr(config.mapping, "clip_cp_temporal_persistence", 0)),
             )
             self.clip_cp_obstacle_map.set_text_features(
                 _cp_text_feats, _cp_labels, _cp_radii,
                 bg_text_features=_bg_text_feats,
-                bg_labels=_bg_labels if self.use_clip_argmax_obstacle_map else None,
+                bg_labels=_bg_labels if (self.use_clip_argmax_obstacle_map or _cp_use_margin) else None,
             )
 
         self.use_yolo_cp_obstacle_map = bool(getattr(config.mapping, "use_yolo_cp_obstacle_map", False))
@@ -265,6 +282,7 @@ class Navigator:
         # GT label map for ACI calibration (simulation only)
         self._gt_label_map: np.ndarray = None   # [n_cells, n_cells], 0=bg, 1+=obstacle
         self._gt_labels: List[str] = []          # label_idx-1 → label name
+        self._oracle_noise_rate: float = 0.0     # fraction of GT obstacle samples to randomly drop
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
 
@@ -335,6 +353,10 @@ class Navigator:
                           ) -> None:
         self.one_map.set_camera_matrix(camera_matrix)
 
+    def set_oracle_noise_rate(self, rate: float) -> None:
+        """Set probability of dropping a GT obstacle calibration sample (oracle noise ablation)."""
+        self._oracle_noise_rate = float(np.clip(rate, 0.0, 1.0))
+
     def set_gt_label_map(self, label_map: np.ndarray, labels: List[str]) -> None:
         """Set GT semantic label map for ACI calibration (simulation only).
 
@@ -353,9 +375,7 @@ class Navigator:
         :param txt: List of strings
         :return:
         """
-        for t in txt:
-            if t in self.class_map:
-                txt[txt.index(t)] = self.class_map[t]
+        txt = [self.class_map.get(t, t) for t in txt]
         if txt != self.query_text:
             print(f"Setting query to {txt}")
             self.query_text = txt
@@ -367,17 +387,32 @@ class Navigator:
             if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
                 self.yolo_obstacle_map.set_query_label(self.query_text[0])
             self.object_detected = False
+            if self.gclip_model is not None and self._cp_detection_gate:
+                self._gclip_query_feat = self.gclip_model.get_text_features(
+                    [f"a {self.query_text[0]}"]
+                ).to(self.one_map.map_device)
             self.get_map(False)
 
-    def get_active_navigable_map(self) -> np.ndarray:
+    def get_active_navigable_map(self, robot_pos: np.ndarray = None) -> np.ndarray:
         if self.use_clip_semantic_nav_map and self.semantic_navigable_map is not None:
             base = self.semantic_navigable_map
         else:
             base = self.one_map.navigable_map
         if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
             base = self.yolo_obstacle_map.apply_to_navigable_map(base)
+        # Goal-zone anti-STUCK: skip CP obstacle map when robot is within 1.5m of detected goal.
+        # Prevents the obstacle ring around the target object from blocking the final approach.
+        _goal_zone_cells = 15  # 1.5m at 0.1m/cell
+        _near_goal = (
+            self._cp_goal_zone_disable
+            and robot_pos is not None
+            and self.object_detected
+            and self.chosen_detection is not None
+            and np.linalg.norm(robot_pos - np.array(self.chosen_detection)) < _goal_zone_cells
+        )
         if (self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map) and self.clip_cp_obstacle_map is not None:
-            base = self.clip_cp_obstacle_map.apply_to_navigable_map(base)
+            if not _near_goal:
+                base = self.clip_cp_obstacle_map.apply_to_navigable_map(base)
         if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
             base = self.yolo_cp_obstacle_map.apply_to_navigable_map(base)
         return base
@@ -550,7 +585,7 @@ class Navigator:
                 self.path = [start] * 5
                 # We are close to the object, we don't need to move
                 return
-            self.path = Planning.compute_to_goal(start, self.get_active_navigable_map(),
+            self.path = Planning.compute_to_goal(start, self.get_active_navigable_map(robot_pos=start),
                                                  (self.one_map.confidence_map > 0).cpu().numpy(),
                                                  self.chosen_detection,
                                                  self.obstcl_kernel_size, self.min_goal_dist)
@@ -587,21 +622,39 @@ class Navigator:
             # but not checked map
             # For that we make use of the cluster_high_similarity_regions function, and project the points to the
             # navigable map
-            adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-            map_def = self.previous_sims[0].numpy()
-            normalized_map = (map_def - map_def.min()) / (map_def.max() - map_def.min())
-            # TODO This will give us wrong cluster scores, we will need to adjust this to match the frontier scores!
-            clusters = cluster_high_similarity_regions(normalized_map,
-                                                       (self.one_map.confidence_map > 0.0).cpu().numpy())
-            # clusters = cluster_high_similarity_regions(normalized_map, map_def > 0.0)
-            for cluster in clusters:
-                cluster.compute_score(adjusted_score)
-                if len(self.blacklisted_nav_goals) == 0 or not np.any(
-                        np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
-                    if ((largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float),
-                                                                         measureDist=True) > -15.0) or
-                        self.one_map.fully_explored_map[cluster.center[0], cluster.center[1]]) and \
-                            (not self.one_map.checked_map[cluster.center[0], cluster.center[1]]):
+            if self.previous_sims is not None:
+                adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
+                map_def = self.previous_sims[0].numpy()
+                normalized_map = (map_def - map_def.min()) / (map_def.max() - map_def.min())
+                # TODO This will give us wrong cluster scores, we will need to adjust this to match the frontier scores!
+                clusters = cluster_high_similarity_regions(normalized_map,
+                                                           (self.one_map.confidence_map > 0.0).cpu().numpy())
+                # clusters = cluster_high_similarity_regions(normalized_map, map_def > 0.0)
+                for cluster in clusters:
+                    cluster.compute_score(adjusted_score)
+            else:
+                clusters = []
+
+            if clusters:
+                centers = np.array([c.center for c in clusters])          # [K, 2]
+                explored_ok = self.one_map.fully_explored_map[centers[:, 0], centers[:, 1]]
+                not_checked  = ~self.one_map.checked_map[centers[:, 0], centers[:, 1]]
+
+                if len(self.blacklisted_nav_goals) > 0:
+                    pts = np.array([c.get_descr_point() for c in clusters])  # [K, 2]
+                    bl  = np.asarray(self.blacklisted_nav_goals)              # [B, 2]
+                    blacklisted = np.any(np.all(pts[:, None, :] == bl[None, :, :], axis=2), axis=1)
+                else:
+                    blacklisted = np.zeros(len(clusters), dtype=bool)
+
+                for i, cluster in enumerate(clusters):
+                    if blacklisted[i]:
+                        continue
+                    contour_ok = (largest_contour is None or
+                                  cv2.pointPolygonTest(largest_contour,
+                                                       cluster.center.astype(float),
+                                                       measureDist=True) > -15.0)
+                    if (contour_ok or explored_ok[i]) and not_checked[i]:
                         self.nav_goals.append(cluster)
             if self.log:
                 cluster_max_similarity = np.zeros_like(self.previous_sims[0])
@@ -624,19 +677,20 @@ class Navigator:
             # set the score of the fully explored map to 0 for the frontiers
             valid_frontiers_mask = np.zeros((len(frontiers),), dtype=bool)
 
+            confidence_np = (self.one_map.confidence_map > 0).cpu().numpy()
+            bl_arr = np.asarray(self.blacklisted_nav_goals) if len(self.blacklisted_nav_goals) > 0 else None
             for i_frontier, frontier in enumerate(frontiers):
-                frontier_mp = get_frontier_midpoint(frontier).astype(np.uint32)
+                frontier_mp = np.round(get_frontier_midpoint(frontier).astype(np.uint32))
+                if bl_arr is not None and np.any(np.all(frontier_mp == bl_arr, axis=1)):
+                    continue
                 score, n_els, best_reachable, reachable_area = Planning.compute_reachable_area_score(
                     frontier_mp,
-                    (self.one_map.confidence_map > 0).cpu().numpy(),
+                    confidence_np,
                     adjusted_score_frontier,
                     self.frontier_depth)
-                frontier_mp = np.round(frontier_mp)
-                if len(self.blacklisted_nav_goals) == 0 or not np.any(
-                        np.all(frontier_mp == self.blacklisted_nav_goals, axis=1)):
-                    valid_frontiers_mask[i_frontier] = True
-                    self.nav_goals.append(
-                        Frontier(frontier_midpoint=frontier_mp, points=frontier, frontier_score=score))
+                valid_frontiers_mask[i_frontier] = True
+                self.nav_goals.append(
+                    Frontier(frontier_midpoint=frontier_mp, points=frontier, frontier_score=score))
 
             if self.log:
                 if len(self.nav_goals) > 0:
@@ -735,23 +789,20 @@ class Navigator:
             # OACP ACI calibration: use GT labels of near-field cells (simulation)
             if (self.clip_cp_obstacle_map.use_oacp
                     and self._gt_label_map is not None):
-                delta_cells = max(1, int(1.0 / self.one_map.cell_size))
+                delta_cells = max(1, int(3.0 / self.one_map.cell_size))
                 x0 = max(0, px - delta_cells)
                 x1 = min(self.one_map.n_cells, px + delta_cells + 1)
                 y0 = max(0, py - delta_cells)
                 y1 = min(self.one_map.n_cells, py + delta_cells + 1)
                 region = self._gt_label_map[x0:x1, y0:y1]
                 if region.any():
-                    conf_map = (self.one_map.confidence_map_gclip
-                                if self.gclip_model is not None
-                                else self.one_map.confidence_map)
                     xs, ys = np.nonzero(region)
                     for dx, dy in zip(xs, ys):
                         cx, cy = x0 + dx, y0 + dy
-                        if conf_map[cx, cy] < 1:
-                            continue  # cell not yet observed
                         lbl_idx = int(region[dx, dy])
                         true_label = self._gt_labels[lbl_idx - 1]
+                        if self._oracle_noise_rate > 0 and np.random.rand() < self._oracle_noise_rate:
+                            continue  # oracle noise: drop this GT sample
                         self.clip_cp_obstacle_map.calibrate_aci(
                             _cp_feats[cx, cy, :], true_label
                         )
@@ -807,13 +858,19 @@ class Navigator:
                     x_rot += odometry[0, 3]
                     y_rot += odometry[1, 3]
 
-                    x_id = ((x_rot / self.one_map.cell_size)).astype(np.uint32) + \
+                    x_id = ((x_rot / self.one_map.cell_size)).astype(np.int32) + \
                            self.one_map.map_center_cells[0].item()
-                    y_id = ((y_rot / self.one_map.cell_size)).astype(np.uint32) + \
+                    y_id = ((y_rot / self.one_map.cell_size)).astype(np.int32) + \
                            self.one_map.map_center_cells[1].item()
+                    # Clamp to valid range
+                    x_id = np.clip(x_id, 0, self.one_map.n_cells - 1)
+                    y_id = np.clip(y_id, 0, self.one_map.n_cells - 1)
 
                     object_valid = True
-                    adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
+                    if self.previous_sims is not None:
+                        adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
+                    else:
+                        adjusted_score = np.ones((self.one_map.n_cells, self.one_map.n_cells))
                     if self.log:
                         rr.log("map/proj_detect",
                                rr.Points2D(np.stack((x_id, y_id)).T, colors=[[0, 0, 255]], radii=[1]))
@@ -861,6 +918,21 @@ class Navigator:
                             # self.chosen_detection = (x_id[best], y_id[best])
                         # --- End of comment ---
                         self.chosen_detection = (x_id[best], y_id[best])
+                    # W: detection gate — reject if any GCLIP obstacle label outscores query at detection cell
+                    if object_valid and self._cp_detection_gate and self.clip_cp_obstacle_map is not None and self._gclip_query_feat is not None:
+                        cx, cy = self.chosen_detection
+                        feat = self.one_map.feature_map_gclip[cx, cy]
+                        if feat.norm() > 1e-6:
+                            feat_n = F.normalize(feat.unsqueeze(0), dim=1)
+                            obs_feats = self.clip_cp_obstacle_map._text_features.to(feat_n.device)
+                            if obs_feats.dtype != feat_n.dtype:
+                                obs_feats = obs_feats.to(feat_n.dtype)
+                            max_obs_sim = float((feat_n @ obs_feats.T).max())
+                            q_feat = self._gclip_query_feat.to(feat_n.device)
+                            if q_feat.dtype != feat_n.dtype:
+                                q_feat = q_feat.to(feat_n.dtype)
+                            if max_obs_sim > float((feat_n @ q_feat.T).squeeze()):
+                                object_valid = False  # obstacle label dominates → reject detection
                     if object_valid:
                         self.object_detected = True
                         self.compute_best_path(start)
@@ -877,6 +949,58 @@ class Navigator:
         elif not self.object_detected:
             self.chosen_detection = None
             self.object_detected = False
+        # GCLIP-based stop: when YOLO misses the target, use GCLIP similarity
+        # in the agent's neighborhood to detect proximity to query object.
+        if not hasattr(self, '_gclip_stop_debug_counter'):
+            self._gclip_stop_debug_counter = 0
+        if not self.object_detected and self._cp_detection_gate and \
+                self.gclip_model is not None and self._gclip_query_feat is not None and \
+                hasattr(self.one_map, 'feature_map_gclip'):
+            _r = 10  # check 21x21 neighborhood (~2m radius)
+            _ax, _ay = int(px), int(py)
+            _x0 = max(0, _ax - _r)
+            _x1 = min(self.one_map.n_cells, _ax + _r + 1)
+            _y0 = max(0, _ay - _r)
+            _y1 = min(self.one_map.n_cells, _ay + _r + 1)
+            _local_feats = self.one_map.feature_map_gclip[_x0:_x1, _y0:_y1]
+            _local_norms = _local_feats.norm(dim=-1)
+            _observed = _local_norms > 1e-6
+            if _observed.sum() > 20:
+                _obs_feats = _local_feats[_observed]
+                _obs_feats_n = F.normalize(_obs_feats.float(), dim=1)
+                _q = self._gclip_query_feat.to(_obs_feats_n.device).float()
+                _sims = (_obs_feats_n @ _q.T).squeeze(-1)
+                _top_sim = float(_sims.max())
+                _mean_sim = float(_sims.mean())
+                # Compare against the GLOBAL mean GCLIP query similarity for reference
+                _all_feats = self.one_map.feature_map_gclip
+                _all_norms = _all_feats.norm(dim=-1)
+                _all_observed = _all_norms > 1e-6
+                if _all_observed.sum() > 100:
+                    _all_obs = _all_feats[_all_observed]
+                    _all_obs_n = F.normalize(_all_obs.float(), dim=1)
+                    _all_sims = (_all_obs_n @ _q.T).squeeze(-1)
+                    _global_mean = float(_all_sims.mean())
+                    _global_top = float(_all_sims.max())
+                    # Local neighborhood should be significantly above global mean
+                    # AND the local top should be close to the global top
+                    _local_above = _mean_sim - _global_mean
+                    _top_ratio = _top_sim / max(_global_top, 1e-6)
+                    if self._gclip_stop_debug_counter % 100 == 0:
+                        print(f"  [GCLIP-stop] local_top={_top_sim:.4f}, local_mean={_mean_sim:.4f}, "
+                              f"global_mean={_global_mean:.4f}, global_top={_global_top:.4f}, "
+                              f"delta={_local_above:.4f}, top_ratio={_top_ratio:.3f}")
+                    self._gclip_stop_debug_counter += 1
+                    # Trigger: local mean is well above global, and local top is near global top
+                    if _local_above > 0.01 and _top_ratio > 0.85 and _top_sim > 0.25:
+                        # Find the cell with max GCLIP query similarity in neighborhood
+                        _local_sims_map = torch.full((_x1-_x0, _y1-_y0), -1.0)
+                        _local_sims_map[_observed] = _sims
+                        _best_local = torch.argmax(_local_sims_map.view(-1))
+                        _bx = _best_local // (_y1-_y0) + _x0
+                        _by = _best_local % (_y1-_y0) + _y0
+                        self.chosen_detection = (int(_bx), int(_by))
+                        self.object_detected = True
         if not self.object_detected:
             if self.saw_left:
                 self.cyclic_detect_checker.add_state_action(np.array([px, py]), "L")
@@ -912,10 +1036,71 @@ class Navigator:
                     rr.log("path_updates", rr.TextLog("Current path lost similarity."))
         if self.allow_replan:
             self.compute_best_path(start)
-        if self.object_detected and len(self.path) < 3:
+        # Path-2: step-level safety guard. Halt in place if upcoming few cells of the
+        # current path intersect the latest CP obstacle mask AND the hit cell is
+        # outside the goal zone. (Inside the goal zone the planner intentionally
+        # ignores CP via zone_disable, so guard must defer there or we'd deadlock.)
+        if (self._cp_step_guard
+                and (self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map)
+                and self.clip_cp_obstacle_map is not None
+                and self.path is not None
+                and len(self.path) > self.path_id):
+            _mask = self.clip_cp_obstacle_map._obstacle_mask
+            _k = self._cp_step_guard_lookahead
+            _goal_zone_cells = 15
+            _chosen = self.chosen_detection if (self._cp_goal_zone_disable and self.object_detected) else None
+            _hit = False
+            for _w in self.path[self.path_id:self.path_id + _k]:
+                _cx, _cy = int(_w[0]), int(_w[1])
+                if not (0 <= _cx < _mask.shape[0] and 0 <= _cy < _mask.shape[1]):
+                    continue
+                if not _mask[_cx, _cy]:
+                    continue
+                if _chosen is not None:
+                    _dx, _dy = _cx - int(_chosen[0]), _cy - int(_chosen[1])
+                    if _dx * _dx + _dy * _dy < _goal_zone_cells * _goal_zone_cells:
+                        continue  # inside goal zone: defer to zone_disable
+                _hit = True
+                break
+            if _hit:
+                # Halt in place this frame: dummy path of the current cell so the
+                # controller produces zero-velocity instead of falling back to
+                # actor.py's move_forward default when path is None.
+                self.path = [start] * 5
+                self.path_id = 0
+        if self.object_detected and self.path is not None and len(self.path) < 3:
             self.object_detected = False
             return True
         self.last_pose = (px, py, yaw)
+
+    def add_side_data(self,
+                      image: np.ndarray,
+                      depth: np.ndarray,
+                      odometry: np.ndarray,
+                      ) -> None:
+        """
+        Updates the GCLIP semantic obstacle map from a side camera.
+
+        Only runs GCLIP inference and update_gclip() — does NOT call update()
+        (project_dense) because that path assumes a forward-facing camera and
+        produces wrong world projections for off-axis sensors.
+
+        The existing min-depth aggregation in update_gclip() naturally implements
+        "best camera" selection: for each grid cell the camera with the smallest
+        depth (most direct / perpendicular view) wins, so left-side obstacles are
+        filled from the left camera and right-side from the right camera.
+
+        :param image: RGB image [C, H, W]
+        :param depth: depth image [H, W]
+        :param odometry: 4x4 camera-to-world transform with rotation R_z(yaw ± π/2)
+        """
+        if not self.one_map.camera_initialized:
+            return
+        if self.gclip_model is None:
+            return
+        odometry = odometry.astype(np.float32)
+        gclip_features = self.gclip_model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+        self.one_map.update_gclip(gclip_features, depth, odometry)
 
     def get_map(self,
                 return_map=True

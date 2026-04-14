@@ -76,6 +76,8 @@ class MONActor(Actor):
         return result
 
     def _act(self, observations: Dict[str, any]) -> Tuple[Dict, bool]:
+        # Reset GCLIP updated mask once per frame so all 3 cameras accumulate into it
+        self.mapper.one_map.reset_gclip_mask()
         return_act = {}
         state = observations["state"]
         pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
@@ -94,6 +96,26 @@ class MONActor(Actor):
         r = r.as_matrix()
         transformation_matrix = np.hstack((r, pos))
         transformation_matrix = np.vstack((transformation_matrix, np.array([0, 0, 0, 1])))
+
+        # Side cameras: CLIP + obstacle map update before main add_data so their
+        # features are included in the same-frame get_map() call.
+        if "rgb_left" in observations and "depth_left" in observations:
+            r_left = R.from_euler("xyz", [0, 0, yaw + np.pi / 2]).as_matrix()
+            tf_left = np.vstack((np.hstack((r_left, pos)), [0, 0, 0, 1]))
+            self.mapper.add_side_data(
+                observations["rgb_left"][:, :, :-1].transpose(2, 0, 1),
+                observations["depth_left"].astype(np.float32),
+                tf_left,
+            )
+        if "rgb_right" in observations and "depth_right" in observations:
+            r_right = R.from_euler("xyz", [0, 0, yaw - np.pi / 2]).as_matrix()
+            tf_right = np.vstack((np.hstack((r_right, pos)), [0, 0, 0, 1]))
+            self.mapper.add_side_data(
+                observations["rgb_right"][:, :, :-1].transpose(2, 0, 1),
+                observations["depth_right"].astype(np.float32),
+                tf_right,
+            )
+
         obj_found = self.mapper.add_data(observations["rgb"][:, :, :-1].transpose(2, 0, 1),
                              observations["depth"].astype(np.float32),
                              transformation_matrix)

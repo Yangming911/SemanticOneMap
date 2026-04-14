@@ -1,3 +1,4 @@
+from typing import List, Optional
 from spock import spock, SpockBuilder
 
 from config import HabitatControllerConf, MappingConf, PlanningConf
@@ -20,6 +21,8 @@ class EvalConf:
     results_path: str = "results/"
     ep_start: int = 0        # first episode index (inclusive)
     ep_end: int = 999999     # last episode index (exclusive), 999999 = all
+    include_ids: Optional[List[int]] = None  # if set, only run these post-slice episode indices
+    dataset_type: Optional[str] = None  # "hm3d", "mp3d", "gibson"; None = auto from is_gibson
 
 
 def load_eval_config():

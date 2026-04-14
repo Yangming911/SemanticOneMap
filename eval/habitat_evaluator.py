@@ -2,6 +2,7 @@
 from eval import get_closest_dist, FMMPlanner
 from eval.actor import Actor
 from eval.dataset_utils.gibson_dataset import load_gibson_episodes
+from eval.dataset_utils.mp3d_dataset import load_mp3d_episodes
 from eval.semantic_collision import build_semantic_collision_data, metric_to_px, _build_label_seed_map
 from mapping.semantic_debug import SemanticPredGTCollector, YOLOObstacleDebugCollector
 from mapping import rerun_logger
@@ -86,6 +87,16 @@ class HabitatEvaluator:
         self.episodes = []
         self.exclude_ids = []
         self.is_gibson = config.is_gibson
+        # dataset_type: explicit or derived from is_gibson for backward compat
+        _dt = getattr(config, "dataset_type", None)
+        if _dt:
+            self.dataset_type = _dt
+        else:
+            self.dataset_type = "gibson" if config.is_gibson else "hm3d"
+        _noise_rate = float(getattr(config, "oracle_noise_rate", 0.0))
+        if _noise_rate > 0.0 and hasattr(actor, "mapper"):
+            actor.mapper.set_oracle_noise_rate(_noise_rate)
+            print(f"[EvalConf] Oracle noise rate: {_noise_rate:.2f}")
 
         self.sim = None
         self.actor = actor
@@ -105,11 +116,15 @@ class HabitatEvaluator:
                 self.dataset_info = pickle.load(f)
         else:
             self.dataset_info = None
-        if self.is_gibson:
+        if self.dataset_type == "gibson":
             self.episodes, self.scene_data = GibsonDataset.load_gibson_episodes(self.episodes,
                                                                                 self.scene_data,
                                                                                 self.dataset_info,
                                                                                 self.object_nav_path)
+        elif self.dataset_type == "mp3d":
+            self.episodes, self.scene_data = MP3DDataset.load_mp3d_episodes(self.episodes,
+                                                                            self.scene_data,
+                                                                            self.object_nav_path)
         else:
             if self.multi_object:
                 self.episodes, self.scene_data = HM3DMultiDataset.load_hm3d_multi_episodes(self.episodes,
@@ -127,6 +142,10 @@ class HabitatEvaluator:
         ep_start = getattr(config, "ep_start", 0)
         ep_end = getattr(config, "ep_end", 999999)
         self.episodes = self.episodes[ep_start:ep_end]
+        _inc = getattr(config, "include_ids", None)
+        if _inc is not None and len(_inc) > 0:
+            _inc_set = set(int(i) for i in _inc)
+            self.exclude_ids = [i for i in range(len(self.episodes)) if i not in _inc_set]
         self.semantic_collision_cache = {}
         self.debug_collector = SemanticPredGTCollector()
         if self.actor is not None:
@@ -142,8 +161,10 @@ class HabitatEvaluator:
             self.sim.close()
         backend_cfg = habitat_sim.SimulatorConfiguration()
         backend_cfg.scene_id = self.scene_path + scene_id
-        if self.is_gibson:
-            pass # TODO
+        if self.dataset_type == "gibson":
+            pass  # TODO
+        elif self.dataset_type == "mp3d":
+            pass  # MP3D loads .glb directly; semantic .ply is auto-detected by habitat-sim
         else:
             backend_cfg.scene_dataset_config_file = self.scene_path + "hm3d/hm3d_annotated_basis.scene_dataset_config.json"
 
@@ -162,19 +183,56 @@ class HabitatEvaluator:
         depth.sensor_type = habitat_sim.SensorType.DEPTH
         depth.position = np.array([0, 0.88, 0])
         depth.resolution = [res, res]
+
+        # Left side camera: R_y(+π/2) rotates default -Z to -X in Habitat = nav +Y = agent-left
+        rgb_left = habitat_sim.CameraSensorSpec()
+        rgb_left.uuid = "rgb_left"
+        rgb_left.hfov = hfov
+        rgb_left.sensor_type = habitat_sim.SensorType.COLOR
+        rgb_left.position = np.array([0, 0.88, 0])
+        rgb_left.orientation = np.array([0, np.pi / 2, 0])
+        rgb_left.resolution = [res, res]
+
+        depth_left = habitat_sim.CameraSensorSpec()
+        depth_left.uuid = "depth_left"
+        depth_left.hfov = hfov
+        depth_left.sensor_type = habitat_sim.SensorType.DEPTH
+        depth_left.position = np.array([0, 0.88, 0])
+        depth_left.orientation = np.array([0, np.pi / 2, 0])
+        depth_left.resolution = [res, res]
+
+        # Right side camera: R_y(-π/2) rotates default -Z to +X in Habitat = nav -Y = agent-right
+        rgb_right = habitat_sim.CameraSensorSpec()
+        rgb_right.uuid = "rgb_right"
+        rgb_right.hfov = hfov
+        rgb_right.sensor_type = habitat_sim.SensorType.COLOR
+        rgb_right.position = np.array([0, 0.88, 0])
+        rgb_right.orientation = np.array([0, -np.pi / 2, 0])
+        rgb_right.resolution = [res, res]
+
+        depth_right = habitat_sim.CameraSensorSpec()
+        depth_right.uuid = "depth_right"
+        depth_right.hfov = hfov
+        depth_right.sensor_type = habitat_sim.SensorType.DEPTH
+        depth_right.position = np.array([0, 0.88, 0])
+        depth_right.orientation = np.array([0, -np.pi / 2, 0])
+        depth_right.resolution = [res, res]
+
         agent_cfg = habitat_sim.agent.AgentConfiguration(action_space=dict(
             move_forward=ActionSpec("move_forward", ActuationSpec(amount=0.25)),
             turn_left=ActionSpec("turn_left", ActuationSpec(amount=5.0)),
             turn_right=ActionSpec("turn_right", ActuationSpec(amount=5.0)),
         ))
-        agent_cfg.sensor_specifications = [rgb, depth]
+        agent_cfg.sensor_specifications = [rgb, depth, rgb_left, depth_left, rgb_right, depth_right]
         sim_cfg = habitat_sim.Configuration(backend_cfg, [agent_cfg])
         self.sim = habitat_sim.Simulator(sim_cfg)
         if not self.scene_data[scene_id].objects_loaded:
-            if not self.is_gibson:
-                self.scene_data = HM3DDataset.load_hm3d_objects(self.scene_data, self.sim.semantic_scene.objects, scene_id)
-            else:
+            if self.dataset_type == "gibson":
                 self.scene_data = GibsonDataset.load_gibson_objects(self.scene_data, self.dataset_info, scene_id)
+            elif self.dataset_type == "mp3d":
+                self.scene_data = MP3DDataset.load_mp3d_objects(self.scene_data, self.sim.semantic_scene.objects, scene_id)
+            else:
+                self.scene_data = HM3DDataset.load_hm3d_objects(self.scene_data, self.sim.semantic_scene.objects, scene_id)
         cell_size = self.mapping.size / self.mapping.n_points
         gt_seed_map, gt_labels = _build_label_seed_map(
             self.scene_data[scene_id].object_locations, self.mapping.n_points, cell_size, self.is_gibson
@@ -388,7 +446,22 @@ class HabitatEvaluator:
             self._episode_floor_y = float(episode.start_position[1])
             gt_cd = self.get_semantic_collision_data(episode.scene_id, current_obj,
                                                      floor_y=self._episode_floor_y)
-            self.actor.mapper.set_gt_label_map(gt_cd.label_map, gt_cd.labels)
+            # For OACP calibration: build inclusive label map (includes target object).
+            # Normal gt_cd excludes the query label; OACP needs ALL objects incl. target.
+            if getattr(self.actor.mapper, "use_clip_cp_obstacle_map", False):
+                _cell_size = self.mapping.size / self.mapping.n_points
+                _max_r = int(self.planner.max_detect_distance / _cell_size)
+                _gt_oacp = build_semantic_collision_data(
+                    self.scene_data[episode.scene_id].object_locations,
+                    self.mapping.n_points, self.mapping.size, self.is_gibson,
+                    query_label="_oacp_none_",  # dummy: nothing excluded
+                    max_query_radius_cells=_max_r,
+                    floor_y=self._episode_floor_y,
+                    oacp_radius_override=15,  # 1.5m radius to cover GCLIP-projected surface cells
+                )
+                self.actor.mapper.set_gt_label_map(_gt_oacp.label_map, _gt_oacp.labels)
+            else:
+                self.actor.mapper.set_gt_label_map(gt_cd.label_map, gt_cd.labels)
             if self.log_rerun:
                 pts = []
                 for obj in self.scene_data[episode.scene_id].object_locations[current_obj]:
@@ -455,7 +528,23 @@ class HabitatEvaluator:
                 if collided:
                     results[n_ep] = Result.SEMANTIC_COLLISION
                     collision_log.append((episode.episode_id, current_obj, cause_label))
-                    print(f"Semantic collision detected! cause={cause_label}")
+                    # Diagnostic: check if OACP predicted this obstacle cell
+                    _cp = getattr(self.actor.mapper, "clip_cp_obstacle_map", None)
+                    _cp_diag = ""
+                    if _cp is not None:
+                        position = self.sim.get_agent(0).get_state().position
+                        from eval.semantic_collision import metric_to_px
+                        _ax, _ay = metric_to_px(-position[2], -position[0],
+                                                self.mapping.n_points,
+                                                self.mapping.size / self.mapping.n_points)
+                        _was_blocked = bool(_cp.get_obstacle_mask()[_ax, _ay]) if 0 <= _ax < self.mapping.n_points and 0 <= _ay < self.mapping.n_points else False
+                        _seed_val = int(_cp._seed_map[_ax, _ay]) if 0 <= _ax < self.mapping.n_points and 0 <= _ay < self.mapping.n_points else -1
+                        _n_seeds = int((_cp._seed_map > 0).sum())
+                        _n_blocked = int(_cp._obstacle_mask.sum())
+                        _n_base = int(self.actor.mapper.one_map.navigable_map.sum())
+                        _cp_diag = (f" [OACP: agent_cell_blocked={_was_blocked}, seed={_seed_val}, "
+                                    f"total_seeds={_n_seeds}, blocked={_n_blocked}({100*_n_blocked/_n_base:.1f}%), tau={_cp.threshold:.4f}]")
+                    print(f"Semantic collision detected! cause={cause_label} step={steps}{_cp_diag}")
                     break
 
                 if called_found:
@@ -489,7 +578,27 @@ class HabitatEvaluator:
                 if steps % 100 == 0:
                     dist = get_closest_dist(self.sim.get_agent(0).get_state().position[[0, 2]],
                                             self.scene_data[episode.scene_id].object_locations[current_obj], self.is_gibson)
-                    print(f"Step {steps}, current object: {current_obj}, episode_id: {episode.episode_id}, distance to closest object: {dist}")
+                    _cp = getattr(self.actor.mapper, "clip_cp_obstacle_map", None)
+                    _cp_stats = ""
+                    if _cp is not None:
+                        _nav = self.actor.mapper.get_active_navigable_map() if hasattr(self.actor.mapper, "get_active_navigable_map") else None
+                        _base = self.actor.mapper.one_map.navigable_map
+                        _mask = _cp.get_obstacle_mask()
+                        _n_seeds = int((_cp._seed_map > 0).sum())
+                        _n_blocked = int((_mask & _base).sum())
+                        _n_base = int(_base.sum())
+                        _pct = 100.0 * _n_blocked / _n_base if _n_base > 0 else 0
+                        _tau = f"{_cp.threshold:.4f}"
+                        _cp_stats = f"  [CP seeds={_n_seeds} blocked={_n_blocked}({_pct:.1f}%) tau={_tau}]"
+                    print(f"Step {steps}, current object: {current_obj}, episode_id: {episode.episode_id}, distance to closest object: {dist}{_cp_stats}")
+                    # Early stuck detection: if agent hasn't moved >0.1m in last 100 steps, abort episode
+                    if steps >= 100:
+                        _recent = np.array(poses[-100:])
+                        _disp = float(np.linalg.norm(_recent[-1, :2] - _recent[0, :2]))
+                        if _disp < 0.1:
+                            results[n_ep] = Result.FAILURE_STUCK
+                            print(f"Early stuck: displacement={_disp:.4f}m over last 100 steps, aborting episode")
+                            break
                 steps += 1
             poses = np.array(poses)
             # If the last 10 poses didn't change much and we have OOT, assume stuck
@@ -578,6 +687,32 @@ class HabitatEvaluator:
                 except Exception as _e:
                     print(f"Warning: GCLIP alignment collection failed ep={episode.episode_id}: {_e}")
 
+            # OACP calibration log: collect per-episode tau/err trajectory
+            if (_clip_cp is not None
+                    and getattr(self.actor.mapper, "use_clip_cp_obstacle_map", False)
+                    and getattr(_clip_cp, "use_oacp", False)):
+                try:
+                    _calib_log = _clip_cp.get_calibration_log()
+                    if not hasattr(self, "_oacp_calib_rows"):
+                        self._oacp_calib_rows = []
+                    for _entry in _calib_log:
+                        self._oacp_calib_rows.append({
+                            "episode_id": episode.episode_id,
+                            "step": _entry["step"],
+                            "tau": _entry["tau"],
+                            "tau_after": _entry.get("tau_after", _entry["tau"]),
+                            "err": _entry["err"],
+                            "alpha": _entry["alpha"],
+                            "s": _entry["s"],
+                        })
+                    # Per-episode summary
+                    _n_calls = len(_calib_log)
+                    _coverage = (sum(1 for e in _calib_log if e["err"] == 0) / _n_calls) if _n_calls > 0 else float("nan")
+                    _final_tau = _calib_log[-1]["tau"] if _calib_log else float("nan")
+                    print(f"OACP ep={episode.episode_id}: n_calib={_n_calls}, coverage={_coverage:.3f}, final_tau={_final_tau:.4f}")
+                except Exception as _oe:
+                    print(f"Warning: OACP log collection failed ep={episode.episode_id}: {_oe}")
+
         total_time = time.time() - eval_start
         from datetime import datetime
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -598,6 +733,13 @@ class HabitatEvaluator:
                 w.writeheader()
                 w.writerows(self._gclip_align_rows)
             print(f"Saved GCLIP alignment CSV: {align_csv}")
+        if hasattr(self, "_oacp_calib_rows") and self._oacp_calib_rows:
+            oacp_csv = f"{self.results_path}/oacp_calibration_{_ts}.csv"
+            with open(oacp_csv, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["episode_id","step","tau","tau_after","err","alpha","s"])
+                w.writeheader()
+                w.writerows(self._oacp_calib_rows)
+            print(f"Saved OACP calibration CSV: {oacp_csv}")
         sr = success / n_eps if n_eps > 0 else 0.0
         spl = spl_accum / n_eps if n_eps > 0 else 0.0
         result_counts = {r: results.count(r) for r in Result}

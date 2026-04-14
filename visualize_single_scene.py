@@ -687,6 +687,14 @@ def main() -> None:
                     f"yaw: {yaw:.2f}",
                 ],
             )
+            _half = PANEL_SIZE // 2
+            _left_bgr = cv2.cvtColor(observations["rgb_left"][:, :, :3], cv2.COLOR_RGB2BGR)
+            _right_bgr = cv2.cvtColor(observations["rgb_right"][:, :, :3], cv2.COLOR_RGB2BGR)
+            left_half = cv2.resize(_left_bgr, (PANEL_SIZE, _half), interpolation=cv2.INTER_AREA)
+            right_half = cv2.resize(_right_bgr, (PANEL_SIZE, _half), interpolation=cv2.INTER_AREA)
+            cv2.putText(left_half, "Left", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(right_half, "Right", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+            side_views = np.concatenate([left_half, right_half], axis=0)
             obstacle_panel = build_obstacle_panel(active_nav)
             obstacle_title = (
                 "Semantic-Inflated Navigable Map + A*"
@@ -786,19 +794,19 @@ def main() -> None:
                     "Obstacle Layers (grey=depth, purple=CLIP-CP)",
                 )
                 if gclip_panel is not None:
-                    # 2 rows: top=[rgb, layers, gclip_sim], bottom=[obstacle, semantic, gt]
-                    top_row = np.concatenate([rgb_panel, layers_panel, gclip_panel], axis=1)
-                    bottom_row = np.concatenate([obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
+                    # 2 rows: top=[side_views, rgb, layers, gclip_sim], bottom=[side_views, obstacle, semantic, gt]
+                    top_row = np.concatenate([side_views, rgb_panel, layers_panel, gclip_panel], axis=1)
+                    bottom_row = np.concatenate([np.zeros((PANEL_SIZE, PANEL_SIZE, 3), dtype=np.uint8), obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
                     frame = np.concatenate([top_row, bottom_row], axis=0)
                 else:
-                    frame = np.concatenate([rgb_panel, layers_panel, semantic_panel, gt_semantic_panel], axis=1)
+                    frame = np.concatenate([side_views, rgb_panel, layers_panel, semantic_panel, gt_semantic_panel], axis=1)
             elif gclip_panel is not None:
                 # No CP layers but GCLIP is active — show gclip sim panel
-                top_row = np.concatenate([rgb_panel, obstacle_panel, gclip_panel], axis=1)
-                bottom_row = np.concatenate([np.zeros_like(rgb_panel), semantic_panel, gt_semantic_panel], axis=1)
+                top_row = np.concatenate([side_views, rgb_panel, obstacle_panel, gclip_panel], axis=1)
+                bottom_row = np.concatenate([np.zeros((PANEL_SIZE, PANEL_SIZE, 3), dtype=np.uint8), np.zeros_like(rgb_panel), semantic_panel, gt_semantic_panel], axis=1)
                 frame = np.concatenate([top_row, bottom_row], axis=0)
             else:
-                frame = np.concatenate([rgb_panel, obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
+                frame = np.concatenate([side_views, rgb_panel, obstacle_panel, semantic_panel, gt_semantic_panel], axis=1)
 
             if writer is None:
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")

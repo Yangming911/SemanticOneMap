@@ -40,6 +40,14 @@ class MappingConf:
     clip_cp_window_size: Optional[int] = 200
     clip_cp_gamma: Optional[float] = 0.05
     clip_cp_initial_alpha: Optional[float] = 0.5
+    clip_cp_use_margin: Optional[bool] = False
+    clip_cp_max_seeds_per_label: Optional[int] = 100
+    clip_cp_temporal_persistence: Optional[int] = 0
+    clip_cp_detection_gate: Optional[bool] = False
+    clip_cp_safety_radius_scale: Optional[float] = 1.0
+    clip_cp_safety_radius_add: Optional[int] = 0
+    clip_cp_step_guard: Optional[bool] = False
+    clip_cp_step_guard_lookahead: Optional[int] = 3
     use_yolo_cp_obstacle_map: Optional[bool] = False
     yolo_cp_threshold: Optional[float] = 0.5
     yolo_cp_target_coverage: Optional[float] = 0.9

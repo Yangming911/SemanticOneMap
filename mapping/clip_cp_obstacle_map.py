@@ -33,6 +33,9 @@ class CLIPCPObstacleMap:
         window_size: int = 200,
         gamma: float = 0.05,
         initial_alpha: float = 0.5,
+        use_margin_score: bool = False,
+        max_seeds_per_label: int = 0,   # 0 = unlimited; >0 = keep only top-K seeds per label
+        temporal_persistence: int = 0,  # 0 = disabled; N>0 = cell must be seed for N consecutive frames
     ) -> None:
         self.n_cells = n_cells
         self.cell_size = cell_size
@@ -40,9 +43,17 @@ class CLIPCPObstacleMap:
         self.use_oacp = use_oacp
         self.target_coverage = target_coverage
 
+        # Margin-based score mode: s = (max_bg_sim - sim(feat, label) + 1) / 2
+        # Replaces raw 1-sim score; threshold lives near 0.5 (argmax boundary)
+        self.use_margin_score = use_margin_score
+        self.max_seeds_per_label = int(max_seeds_per_label)
+        self.temporal_persistence = int(temporal_persistence)
+
         # ACI state
-        self._alpha_t = initial_alpha       # risk level (miscoverage rate)
-        self._gamma = gamma                 # ACI step size
+        self._initial_alpha = initial_alpha  # stored for reset()
+        self._initial_threshold = threshold  # stored for reset()
+        self._alpha_t = initial_alpha        # risk level (miscoverage rate)
+        self._gamma = gamma                  # ACI step size
         self._alpha_target = 1.0 - target_coverage  # target miscoverage rate
 
         # Set by set_text_features() after CLIP model is ready
@@ -57,12 +68,20 @@ class CLIPCPObstacleMap:
 
         # Per-cell state: 0 = free, label_idx+1 = predicted obstacle
         self._seed_map = np.zeros((n_cells, n_cells), dtype=np.uint8)
+        # Temporal persistence: remember raw seeds from previous frame
+        self._prev_seed_map = np.zeros((n_cells, n_cells), dtype=np.uint8)
+        # Nonconformity score at each seed cell (lower = more confident obstacle)
+        self._seed_score_map = np.ones((n_cells, n_cells), dtype=np.float32)
         # For bg cells: winning bg label index+1 (0=unobserved or obstacle winner)
         self._bg_winner_map = np.zeros((n_cells, n_cells), dtype=np.uint16)
         self._obstacle_mask = np.zeros((n_cells, n_cells), dtype=bool)
 
         # OACP calibration buffer (nonconformity scores)
         self._scores: deque = deque(maxlen=window_size)
+
+        # Per-call calibration log for experiment analysis
+        self._calib_step: int = 0
+        self._calibration_log: List[dict] = []
 
     # ------------------------------------------------------------------
     def set_text_features(
@@ -102,10 +121,22 @@ class CLIPCPObstacleMap:
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self._seed_map.fill(0)
+        self._seed_score_map.fill(1.0)
         self._obstacle_mask.fill(False)
         self._bg_winner_map.fill(0)
+        self._prev_seed_map.fill(0)
         self._scores.clear()
-        self._alpha_t = 0.5  # reset to conservative
+        self._alpha_t = self._initial_alpha    # restore configured initial value
+        self.threshold = self._initial_threshold
+        self._calib_step = 0
+        self._calibration_log = []
+
+    def get_calibration_log(self) -> List[dict]:
+        """Return a copy of the calibration log and clear it."""
+        log = list(self._calibration_log)
+        self._calibration_log = []
+        self._calib_step = 0
+        return log
 
     # ------------------------------------------------------------------
     def calibrate(
@@ -163,16 +194,25 @@ class CLIPCPObstacleMap:
 
         j = self._labels.index(true_label)
         text_feat = self._text_features[j].to(clip_feat.device)
-        sim = float(
-            F.normalize(clip_feat.unsqueeze(0), dim=1)
-            .mm(text_feat.unsqueeze(0).T)
-            .squeeze()
-        )
-        s = 1.0 - sim  # nonconformity score: low = good match
+        feat_n = F.normalize(clip_feat.unsqueeze(0), dim=1)
+        sim = float(feat_n.mm(text_feat.unsqueeze(0).T).squeeze())
+
+        if self.use_margin_score and self._bg_text_features is not None:
+            # Margin score: s = (max_bg_sim - sim + 1) / 2 ∈ [0, 1]
+            # Obstacle cells: sim > max_bg → s < 0.5 (conformal)
+            # BG cells:       max_bg > sim → s > 0.5 (not conformal)
+            bg_feats = self._bg_text_features.to(clip_feat.device)
+            if bg_feats.dtype != feat_n.dtype:
+                bg_feats = bg_feats.to(feat_n.dtype)
+            max_bg_sim = float((feat_n @ bg_feats.T).squeeze(0).max())
+            s = (max_bg_sim - sim + 1.0) / 2.0
+        else:
+            s = 1.0 - sim  # nonconformity score: low = good match
 
         # err = 1 if current threshold does NOT cover the true label
         C_t = 1.0 - self.threshold  # nonconformity threshold
         err = float(s > C_t)
+        tau_before = self.threshold  # log pre-update tau for correct convergence plots
 
         # ACI gradient step
         self._alpha_t = float(np.clip(
@@ -185,6 +225,17 @@ class CLIPCPObstacleMap:
         if len(self._scores) >= 5:
             C_new = float(np.quantile(list(self._scores), 1.0 - self._alpha_t))
             self.threshold = float(np.clip(1.0 - C_new, 0.0, 1.0))
+
+        # Log calibration call: tau_before pairs with err at this step
+        self._calibration_log.append({
+            "step": self._calib_step,
+            "tau": tau_before,
+            "tau_after": self.threshold,
+            "err": err,
+            "alpha": self._alpha_t,
+            "s": s,
+        })
+        self._calib_step += 1
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -222,28 +273,59 @@ class CLIPCPObstacleMap:
 
         xs, ys = np.nonzero(changed_np)
         new_seed = self._seed_map.copy()
-
         new_bg_winner = self._bg_winner_map.copy()
-        for i, (cx, cy) in enumerate(zip(xs, ys)):
-            if norms_np[i] < 1e-6:
-                new_seed[cx, cy] = 0
-                continue
-            best_j = int(np.argmax(obs_sims[i]))
-            best_sim = obs_sims[i, best_j]
-            if best_bg_sim is not None:
+
+        # Vectorized cell classification (replaces per-cell Python loop)
+        valid = norms_np >= 1e-6                               # [M] bool
+        best_j = np.argmax(obs_sims, axis=1)                  # [M]
+        best_sim = obs_sims[np.arange(len(obs_sims)), best_j] # [M]
+
+        new_seed[xs[~valid], ys[~valid]] = 0
+
+        new_score = self._seed_score_map.copy()
+
+        if valid.any():
+            vxs, vys = xs[valid], ys[valid]
+            vbest_j   = best_j[valid]
+            vbest_sim = best_sim[valid]
+
+            if self.use_margin_score and best_bg_sim is not None:
+                # Margin-OACP: s = (max_bg - sim + 1) / 2 <= 1 - tau  →  obstacle
+                vs = (best_bg_sim[valid] - vbest_sim + 1.0) / 2.0
+                is_obs = vs <= (1.0 - self.threshold)
+                new_seed[vxs[is_obs],  vys[is_obs]]  = vbest_j[is_obs] + 1
+                new_score[vxs[is_obs],  vys[is_obs]]  = vs[is_obs]
+                new_score[vxs[~is_obs], vys[~is_obs]] = 1.0
+                new_seed[vxs[~is_obs], vys[~is_obs]] = 0
+                new_bg_winner[vxs[is_obs],  vys[is_obs]]  = 0
+                new_bg_winner[vxs[~is_obs], vys[~is_obs]] = (
+                    np.argmax(bg_sims[valid][~is_obs], axis=1) + 1
+                )
+            elif best_bg_sim is not None:
                 # Argmax mode: obstacle wins only if it beats all background labels
-                if best_sim > best_bg_sim[i]:
-                    new_seed[cx, cy] = best_j + 1
-                    new_bg_winner[cx, cy] = 0
-                else:
-                    new_seed[cx, cy] = 0
-                    new_bg_winner[cx, cy] = int(np.argmax(bg_sims[i])) + 1
+                is_obs = vbest_sim > best_bg_sim[valid]
+                new_seed[vxs[is_obs],  vys[is_obs]]  = vbest_j[is_obs] + 1
+                new_seed[vxs[~is_obs], vys[~is_obs]] = 0
+                new_bg_winner[vxs[is_obs],  vys[is_obs]]  = 0
+                new_bg_winner[vxs[~is_obs], vys[~is_obs]] = (
+                    np.argmax(bg_sims[valid][~is_obs], axis=1) + 1
+                )
             else:
                 # Threshold mode: obstacle wins if sim >= τ
-                new_seed[cx, cy] = (best_j + 1) if best_sim >= self.threshold else 0
+                is_obs = vbest_sim >= self.threshold
+                new_seed[vxs[is_obs],  vys[is_obs]]  = vbest_j[is_obs] + 1
+                new_seed[vxs[~is_obs], vys[~is_obs]] = 0
+
+        # Temporal persistence: only keep seeds that were also seeds last frame
+        if self.temporal_persistence > 0:
+            stable = (new_seed > 0) & (self._prev_seed_map > 0)
+            new_seed[~stable] = 0
+            new_score[~stable] = 1.0
+        self._prev_seed_map = new_seed.copy()  # remember raw seeds before TopK for next frame
 
         if not np.array_equal(new_seed, self._seed_map):
             self._seed_map = new_seed
+            self._seed_score_map = new_score
             self._recompute_obstacle_mask()
         self._bg_winner_map = new_bg_winner
 
@@ -253,10 +335,20 @@ class CLIPCPObstacleMap:
         for j, kernel in enumerate(self._kernels):
             if kernel is None:
                 continue
-            seed = (self._seed_map == j + 1).astype(np.uint8)
-            if seed.max() == 0:
+            seed = (self._seed_map == j + 1)
+            if not seed.any():
                 continue
-            combined |= cv2.dilate(seed, kernel, iterations=1).astype(bool)
+            # TopK: keep only the max_seeds_per_label cells with lowest score (most confident)
+            if self.max_seeds_per_label > 0:
+                seed_xs, seed_ys = np.nonzero(seed)
+                n_seeds = len(seed_xs)
+                if n_seeds > self.max_seeds_per_label:
+                    scores = self._seed_score_map[seed_xs, seed_ys]
+                    topk_idx = np.argpartition(scores, self.max_seeds_per_label)[:self.max_seeds_per_label]
+                    seed_pruned = np.zeros_like(seed)
+                    seed_pruned[seed_xs[topk_idx], seed_ys[topk_idx]] = True
+                    seed = seed_pruned
+            combined |= cv2.dilate(seed.astype(np.uint8), kernel, iterations=1).astype(bool)
         self._obstacle_mask = combined
 
     # ------------------------------------------------------------------

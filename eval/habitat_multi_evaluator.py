@@ -157,12 +157,47 @@ class HabitatMultiEvaluator:
         depth.sensor_type = habitat_sim.SensorType.DEPTH
         depth.position = np.array([0, 0.88, 0])
         depth.resolution = [res_y, res_x]
+
+        # Left side camera: R_y(+π/2) rotates default -Z to -X in Habitat = nav +Y = agent-left
+        rgb_left = habitat_sim.CameraSensorSpec()
+        rgb_left.uuid = "rgb_left"
+        rgb_left.hfov = hfov
+        rgb_left.sensor_type = habitat_sim.SensorType.COLOR
+        rgb_left.position = np.array([0, 0.88, 0])
+        rgb_left.orientation = np.array([0, np.pi / 2, 0])
+        rgb_left.resolution = [res_y, res_x]
+
+        depth_left = habitat_sim.CameraSensorSpec()
+        depth_left.uuid = "depth_left"
+        depth_left.hfov = hfov
+        depth_left.sensor_type = habitat_sim.SensorType.DEPTH
+        depth_left.position = np.array([0, 0.88, 0])
+        depth_left.orientation = np.array([0, np.pi / 2, 0])
+        depth_left.resolution = [res_y, res_x]
+
+        # Right side camera: R_y(-π/2) rotates default -Z to +X in Habitat = nav -Y = agent-right
+        rgb_right = habitat_sim.CameraSensorSpec()
+        rgb_right.uuid = "rgb_right"
+        rgb_right.hfov = hfov
+        rgb_right.sensor_type = habitat_sim.SensorType.COLOR
+        rgb_right.position = np.array([0, 0.88, 0])
+        rgb_right.orientation = np.array([0, -np.pi / 2, 0])
+        rgb_right.resolution = [res_y, res_x]
+
+        depth_right = habitat_sim.CameraSensorSpec()
+        depth_right.uuid = "depth_right"
+        depth_right.hfov = hfov
+        depth_right.sensor_type = habitat_sim.SensorType.DEPTH
+        depth_right.position = np.array([0, 0.88, 0])
+        depth_right.orientation = np.array([0, -np.pi / 2, 0])
+        depth_right.resolution = [res_y, res_x]
+
         agent_cfg = habitat_sim.agent.AgentConfiguration(action_space=dict(
             move_forward=ActionSpec("move_forward", ActuationSpec(amount=0.25)),
             turn_left=ActionSpec("turn_left", ActuationSpec(amount=5.0)),
             turn_right=ActionSpec("turn_right", ActuationSpec(amount=5.0)),
         ))
-        agent_cfg.sensor_specifications = [rgb, depth]
+        agent_cfg.sensor_specifications = [rgb, depth, rgb_left, depth_left, rgb_right, depth_right]
         sim_cfg = habitat_sim.Configuration(backend_cfg, [agent_cfg])
         self.sim = habitat_sim.Simulator(sim_cfg)
         if self.scene_data[scene_id].objects_loaded:

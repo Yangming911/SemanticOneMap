@@ -206,14 +206,26 @@ class OneMap:
             self.confidence_map_gclip.zero_()
             self.updated_mask_gclip.zero_()
             self.min_depth_map_gclip.fill_(float('inf'))
+            self.max_norm_map_gclip.zero_()
 
         # Reset iteration counter
         self._iters = 0
         self.agent_height_0 = None
 
-    def init_gclip_map(self, gclip_feature_dim: int):
-        """Initialize GCLIP feature map for dual-model obstacle detection."""
+    def reset_gclip_mask(self):
+        """Reset accumulated GCLIP updated mask. Call once per frame before camera processing."""
+        if self.updated_mask_gclip is not None:
+            self.updated_mask_gclip.zero_()
+
+    def init_gclip_map(self, gclip_feature_dim: int, aggregation: str = "min_depth"):
+        """Initialize GCLIP feature map for dual-model obstacle detection.
+
+        Args:
+            aggregation: "min_depth" (default) — closest camera wins;
+                         "max_norm"  — highest feature-norm camera wins (better for CLIP quality).
+        """
         self.gclip_feature_dim = gclip_feature_dim
+        self.gclip_aggregation = aggregation
         self.feature_map_gclip = torch.zeros(
             (self.n_cells, self.n_cells, gclip_feature_dim), dtype=torch.float32
         ).to(self.map_device)
@@ -223,9 +235,13 @@ class OneMap:
         self.updated_mask_gclip = torch.zeros(
             (self.n_cells, self.n_cells), dtype=torch.bool
         ).to(self.map_device)
-        # Min-depth map: closest depth seen so far per cell (min-depth aggregation)
+        # Min-depth map: used by "min_depth" aggregation
         self.min_depth_map_gclip = torch.full(
             (self.n_cells, self.n_cells), float('inf'), dtype=torch.float32
+        ).to(self.map_device)
+        # Max-norm map: used by "max_norm" aggregation (0 = no observation yet)
+        self.max_norm_map_gclip = torch.zeros(
+            (self.n_cells, self.n_cells), dtype=torch.float32
         ).to(self.map_device)
 
     @torch.no_grad()
@@ -279,7 +295,6 @@ class OneMap:
                  (pcl_grid_ids[:, 0] >= 0) & (pcl_grid_ids[:, 0] < self.n_cells) &
                  (pcl_grid_ids[:, 1] >= 0) & (pcl_grid_ids[:, 1] < self.n_cells))
         if not valid.any():
-            self.updated_mask_gclip.zero_()
             return
 
         gx = pcl_grid_ids[valid, 0].long()
@@ -319,22 +334,33 @@ class OneMap:
         final_depths_cpu = final_depths.to(self.map_device)
         final_feats_cpu = final_feats.to(self.map_device)
 
-        # 6. Only update cells where this frame's min depth < historical min depth
-        stored_min = self.min_depth_map_gclip[ux, uy]
-        should_update = final_depths_cpu < stored_min
+        # 6. Aggregation: decide which cells to update based on strategy
+        if getattr(self, 'gclip_aggregation', 'min_depth') == 'max_norm':
+            # max_norm: keep the feature with the highest L2 norm per cell.
+            # Higher norm ≈ stronger/cleaner CLIP activation ≈ better semantic view.
+            current_norms = final_feats_cpu.norm(dim=1)   # [n_unique]
+            stored_norms = self.max_norm_map_gclip[ux, uy]
+            should_update = current_norms > stored_norms
+            if not should_update.any():
+                return
+            ux_up = ux[should_update]
+            uy_up = uy[should_update]
+            self.feature_map_gclip[ux_up, uy_up] = final_feats_cpu[should_update]
+            self.max_norm_map_gclip[ux_up, uy_up] = current_norms[should_update]
+            self.min_depth_map_gclip[ux_up, uy_up] = final_depths_cpu[should_update]
+        else:
+            # min_depth (default): keep the feature from the closest observation.
+            stored_min = self.min_depth_map_gclip[ux, uy]
+            should_update = final_depths_cpu < stored_min
+            if not should_update.any():
+                return
+            ux_up = ux[should_update]
+            uy_up = uy[should_update]
+            self.feature_map_gclip[ux_up, uy_up] = final_feats_cpu[should_update]
+            self.min_depth_map_gclip[ux_up, uy_up] = final_depths_cpu[should_update]
 
-        if not should_update.any():
-            self.updated_mask_gclip.zero_()
-            return
-
-        ux_up = ux[should_update]
-        uy_up = uy[should_update]
-        self.feature_map_gclip[ux_up, uy_up] = final_feats_cpu[should_update]
-        self.min_depth_map_gclip[ux_up, uy_up] = final_depths_cpu[should_update]
         self.confidence_map_gclip[ux_up, uy_up] += 1.0
-
-        # Updated mask: cells that actually changed this frame
-        self.updated_mask_gclip.zero_()
+        # Updated mask: accumulate across all cameras this frame (reset via reset_gclip_mask())
         self.updated_mask_gclip[ux_up, uy_up] = True
 
     def reset_updated_mask(self):
