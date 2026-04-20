@@ -35,32 +35,19 @@ _SEMANTIC_LABEL_ALIASES = {
     "tv_monitor": "tv",
     "chest_of_drawers": "chest of drawers",
     "dresser": "chest of drawers",
-    "gym_equipment": "gym equipment",
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    # HM3D obstacles (GCLIP nonconformity d-prime analysis, d' > 1.5):
-    "potted plant": 3,
-    "toilet": 3,
-    "pillow": 2,
-    "lamp": 2,
-    # MP3D obstacles (21-category ObjectNav):
-    "bed": 3,
-    "sofa": 3,
-    "couch": 3,
-    "chest of drawers": 2,
-    "cabinet": 2,
-    "sink": 2,
-    "bathtub": 3,
-    "counter": 2,
-    "fireplace": 3,
-    "gym equipment": 3,
-    "stool": 2,
-    "tv": 2,
-    "shower": 2,
-    "cushion": 1,
-    "table": 2,
-    "chair": 1,
+    # dict4: per-class radii tuned via baseline-trajectory pass-through analysis
+    # (analysis/phase1_aggregate.py). Each radius = smallest cell count that
+    # makes baseline collide on at least one mp3d_mini ep (after the new
+    # below-floor phantom filter), without growing so wide that the planner
+    # would be unable to navigate corridors.
+    "shower":           3,
+    "cabinet":          4,
+    "chest of drawers": 4,
+    "table":            5,
+    "tv":               2,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1
@@ -135,8 +122,10 @@ def get_semantic_safety_radius_cells(
 # Height thresholds relative to floor_y:
 #   bottom must be within 0.3 m above floor (not elevated on shelves)
 #   centre must be within 1.5 m above floor (not hanging/wall-mounted)
+#   bottom must be within 0.5 m below floor (not on a lower storey — phantom fix)
 _MAX_BOTTOM_ABOVE_FLOOR = 0.3
 _MAX_CENTER_ABOVE_FLOOR = 1.5
+_MAX_BOTTOM_BELOW_FLOOR = 0.5
 
 
 def _iter_object_metric_points(
@@ -166,6 +155,8 @@ def _iter_object_metric_points(
                 sizes = np.asarray(obj.bbox.sizes, dtype=np.float32)
                 bottom_y = float(center[1]) - float(sizes[1]) / 2.0
                 if (bottom_y - floor_y) > _MAX_BOTTOM_ABOVE_FLOOR:
+                    continue
+                if (floor_y - bottom_y) > _MAX_BOTTOM_BELOW_FLOOR:
                     continue
             except Exception:
                 pass

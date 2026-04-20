@@ -9,11 +9,12 @@ EvalConf:
   log_rerun: False
   use_pointnav: False
   square_im: True
-  results_path: "results/mp3d_baseline_mini"
+  results_path: "results/mp3d_wgate_mp3d_v5e_ep8_maxdist12"
   ep_end: 999999
+  include_ids: [8]
 
 config: [
   ./controller_habitat.yaml,
-  ./mapping_conf_sim.yaml,
+  ./mapping_conf_sim_gclip_oacp_wgate_mp3d_v5e.yaml,
   ./planning_conf.yaml
 ]

@@ -9,7 +9,7 @@ EvalConf:
   log_rerun: False
   use_pointnav: False
   square_im: True
-  results_path: "results/mp3d_baseline_mini"
+  results_path: "results/mp3d_baseline_mini_dict2"
   ep_end: 999999
 
 config: [

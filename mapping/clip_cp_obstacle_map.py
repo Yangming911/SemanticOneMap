@@ -13,7 +13,7 @@ Unexplored cells (feature_norm ≈ 0) are ignored — no prior is applied here.
 The planner must separately handle unexplored regions.
 """
 
-from collections import deque
+from collections import Counter, deque
 from typing import List, Optional, Tuple
 
 import cv2
@@ -82,6 +82,21 @@ class CLIPCPObstacleMap:
         # Per-call calibration log for experiment analysis
         self._calib_step: int = 0
         self._calibration_log: List[dict] = []
+
+        # Worst-case OACP stats: track |C_j| distribution and label combinations
+        self._cj_stats = {
+            "n_updates": 0,
+            "seed_cells": 0,        # cumulative cells with |C_j| >= 1
+            "multi_cells": 0,       # cumulative cells with |C_j| >= 2
+            "flipped_cells": 0,     # cumulative cells where max-radius != argmax-sim
+            "set_counter": Counter(),  # tuple(sorted label indices) -> count
+            # Calibration-time recovery stats (available only at GT-reveal events)
+            "calib_total": 0,
+            "calib_argmax_ok": 0,       # argmax == GT
+            "calib_cp_recovered": 0,    # argmax != GT but GT ∈ C_j (Path A's selling point)
+            "calib_cp_missed": 0,       # argmax != GT and GT ∉ C_j
+        }
+        self._cj_print_every = 50   # print summary every N update() calls
 
     # ------------------------------------------------------------------
     def set_text_features(
@@ -193,9 +208,12 @@ class CLIPCPObstacleMap:
             return  # unobserved cell
 
         j = self._labels.index(true_label)
-        text_feat = self._text_features[j].to(clip_feat.device)
+        text_feats = self._text_features.to(clip_feat.device)
         feat_n = F.normalize(clip_feat.unsqueeze(0), dim=1)
-        sim = float(feat_n.mm(text_feat.unsqueeze(0).T).squeeze())
+        if text_feats.dtype != feat_n.dtype:
+            text_feats = text_feats.to(feat_n.dtype)
+        all_sims_np = (feat_n @ text_feats.T).squeeze(0).detach().cpu().numpy()  # [N_obs]
+        sim = float(all_sims_np[j])
 
         if self.use_margin_score and self._bg_text_features is not None:
             # Margin score: s = (max_bg_sim - sim + 1) / 2 ∈ [0, 1]
@@ -207,12 +225,44 @@ class CLIPCPObstacleMap:
             max_bg_sim = float((feat_n @ bg_feats.T).squeeze(0).max())
             s = (max_bg_sim - sim + 1.0) / 2.0
         else:
+            max_bg_sim = None
             s = 1.0 - sim  # nonconformity score: low = good match
 
         # err = 1 if current threshold does NOT cover the true label
         C_t = 1.0 - self.threshold  # nonconformity threshold
         err = float(s > C_t)
         tau_before = self.threshold  # log pre-update tau for correct convergence plots
+
+        # ---- Path A recovery stats: does worst-case C_j rescue argmax misses? ----
+        # Compute Path A membership for GT using pre-update τ (and bg gate if margin mode).
+        argmax_j = int(np.argmax(all_sims_np))
+        if self.use_margin_score and max_bg_sim is not None:
+            vs_all_cal = (max_bg_sim - all_sims_np + 1.0) / 2.0
+            dominates_bg_cal = all_sims_np > max_bg_sim
+            conf_cal = dominates_bg_cal & (vs_all_cal <= (1.0 - tau_before))
+        else:
+            conf_cal = (1.0 - all_sims_np) <= (1.0 - tau_before)
+        gt_in_cj = bool(conf_cal[j])
+        self._cj_stats["calib_total"] += 1
+        if argmax_j == j:
+            self._cj_stats["calib_argmax_ok"] += 1
+        elif gt_in_cj:
+            self._cj_stats["calib_cp_recovered"] += 1
+        else:
+            self._cj_stats["calib_cp_missed"] += 1
+        tot = self._cj_stats["calib_total"]
+        if tot % 20 == 0:
+            ok   = self._cj_stats["calib_argmax_ok"]
+            rec  = self._cj_stats["calib_cp_recovered"]
+            miss = self._cj_stats["calib_cp_missed"]
+            print(
+                f"[OACP-CP-CALIB] total={tot} "
+                f"argmax_ok={ok} ({100.0*ok/tot:.1f}%) "
+                f"cp_recovered={rec} ({100.0*rec/tot:.1f}%) "
+                f"cp_missed={miss} ({100.0*miss/tot:.1f}%)",
+                flush=True,
+            )
+        # ------------------------------------------------------------------
 
         # ACI gradient step
         self._alpha_t = float(np.clip(
@@ -290,17 +340,66 @@ class CLIPCPObstacleMap:
             vbest_sim = best_sim[valid]
 
             if self.use_margin_score and best_bg_sim is not None:
-                # Margin-OACP: s = (max_bg - sim + 1) / 2 <= 1 - tau  →  obstacle
-                vs = (best_bg_sim[valid] - vbest_sim + 1.0) / 2.0
-                is_obs = vs <= (1.0 - self.threshold)
-                new_seed[vxs[is_obs],  vys[is_obs]]  = vbest_j[is_obs] + 1
-                new_score[vxs[is_obs],  vys[is_obs]]  = vs[is_obs]
+                # Worst-case Margin-OACP (Path A): C_j = { l : sim(l)>max_bg ∧ s(l)≤1−τ }
+                # Bg gate makes each obstacle label individually beat background;
+                # conformal check enforces ACI-calibrated margin.  d_wc = max radius over C_j.
+                v_obs_sims   = obs_sims[valid]                                # [M', N_obs]
+                v_max_bg     = best_bg_sim[valid]                             # [M']
+                vs_all       = (v_max_bg[:, None] - v_obs_sims + 1.0) / 2.0   # [M', N_obs]
+                dominates_bg = v_obs_sims > v_max_bg[:, None]                 # [M', N_obs]
+                conf_mask    = dominates_bg & (vs_all <= (1.0 - self.threshold))
+                radii_arr  = np.asarray(self._radii, dtype=np.int32)          # [N_obs]
+                # Non-conformal labels get radius = -1 so argmax picks only within C_j
+                masked_radii = np.where(conf_mask, radii_arr[None, :], -1)    # [M', N_obs]
+                chosen_j   = np.argmax(masked_radii, axis=1)                  # [M']
+                is_obs     = conf_mask.any(axis=1)                            # [M']
+                chosen_s   = vs_all[np.arange(vs_all.shape[0]), chosen_j]     # [M']
+
+                new_seed[vxs[is_obs],  vys[is_obs]]  = chosen_j[is_obs] + 1
+                new_score[vxs[is_obs],  vys[is_obs]]  = chosen_s[is_obs]
                 new_score[vxs[~is_obs], vys[~is_obs]] = 1.0
                 new_seed[vxs[~is_obs], vys[~is_obs]] = 0
                 new_bg_winner[vxs[is_obs],  vys[is_obs]]  = 0
                 new_bg_winner[vxs[~is_obs], vys[~is_obs]] = (
                     np.argmax(bg_sims[valid][~is_obs], axis=1) + 1
                 )
+
+                # ---- Worst-case C_j stats (for theory-vs-impl analysis) ----
+                cj_sizes = conf_mask.sum(axis=1)                     # [M']
+                seed_mask = cj_sizes >= 1
+                multi_mask = cj_sizes >= 2
+                argmax_sim_j = np.argmax(v_obs_sims, axis=1)         # [M']
+                flipped = seed_mask & (chosen_j != argmax_sim_j)
+                self._cj_stats["seed_cells"]    += int(seed_mask.sum())
+                self._cj_stats["multi_cells"]   += int(multi_mask.sum())
+                self._cj_stats["flipped_cells"] += int(flipped.sum())
+                if multi_mask.any():
+                    conf_multi = conf_mask[multi_mask]               # [M_multi, N_obs]
+                    for row in conf_multi:
+                        key = tuple(int(i) for i in np.nonzero(row)[0])
+                        self._cj_stats["set_counter"][key] += 1
+                self._cj_stats["n_updates"] += 1
+                if self._cj_stats["n_updates"] % self._cj_print_every == 0:
+                    seed = self._cj_stats["seed_cells"]
+                    mult = self._cj_stats["multi_cells"]
+                    flip = self._cj_stats["flipped_cells"]
+                    pct_m = 100.0 * mult / max(seed, 1)
+                    pct_f = 100.0 * flip / max(seed, 1)
+                    top5 = self._cj_stats["set_counter"].most_common(5)
+                    top5_named = [
+                        (
+                            "+".join(self._labels[i] for i in key),
+                            cnt,
+                        )
+                        for key, cnt in top5
+                    ]
+                    print(
+                        f"[OACP-CP-STATS] upd={self._cj_stats['n_updates']} "
+                        f"seeds={seed} |C|>=2={mult} ({pct_m:.1f}%) "
+                        f"flipped={flip} ({pct_f:.1f}%) top5={top5_named}",
+                        flush=True,
+                    )
+                # -----------------------------------------------------------
             elif best_bg_sim is not None:
                 # Argmax mode: obstacle wins only if it beats all background labels
                 is_obs = vbest_sim > best_bg_sim[valid]

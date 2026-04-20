@@ -368,33 +368,36 @@ def build_obstacle_layers_panel(mapper) -> np.ndarray:
     """Combined obstacle panel showing all active layers.
 
     Layer order (bottom → top, each overwrites previous):
-      white   : navigable (all layers clear)
-      grey    : depth point-cloud obstacle
-      red     : YOLO dilated obstacle mask
-      orange  : YOLO raw seed points
-      purple  : YOLO-CP dilated obstacle mask
-      cyan    : YOLO-CP conf seeds (cells where conf > τ before dilation)
+      black      : unexplored / navigable free (default)
+      light grey : depth point-cloud obstacle
+      red        : YOLO dilated obstacle mask
+      orange     : YOLO raw seed points
+      purple     : YOLO-CP / CLIP-CP dilated obstacle mask
+      yellow     : YOLO-CP / CLIP-CP conf seeds
     """
     n = mapper.one_map.n_cells
-    panel = np.full((n, n, 3), 255, dtype=np.uint8)   # start white
+    panel = np.zeros((n, n, 3), dtype=np.uint8)       # start black (match other panels)
 
     base_nav = mapper.one_map.navigable_map.astype(bool)
-    panel[~base_nav] = (80, 80, 80)                   # depth obstacle → grey
+    panel[~base_nav] = (230, 230, 230)                # depth obstacle → light grey
+
+    active_layers = []  # (label, bgr_color) for legend
 
     yolo_map = getattr(mapper, "yolo_obstacle_map", None)
-    if yolo_map is not None:
+    if yolo_map is not None and getattr(mapper, "use_yolo_obstacle_map", False):
         yolo_mask = yolo_map.get_obstacle_mask()
         panel[yolo_mask & base_nav] = (0, 0, 200)     # YOLO dilated → red
         for _frame, _label, px, py in yolo_map._events:
             panel[px, py] = (0, 140, 255)             # YOLO seeds → orange
+        active_layers += [("YOLO dilated", (0, 0, 200)), ("YOLO seeds", (0, 140, 255))]
 
     yolo_cp_map = getattr(mapper, "yolo_cp_obstacle_map", None)
     if yolo_cp_map is not None and getattr(mapper, "use_yolo_cp_obstacle_map", False):
         cp_mask = yolo_cp_map.get_obstacle_mask()
         panel[cp_mask & base_nav] = (180, 0, 180)     # YOLO-CP dilated → purple
-        # Show conf seeds: any cell where max conf across classes ≥ τ
         cp_seeds = (yolo_cp_map._conf_map.max(axis=2) >= yolo_cp_map.threshold)
-        panel[cp_seeds & base_nav] = (255, 200, 0)    # YOLO-CP seeds → cyan/yellow
+        panel[cp_seeds & base_nav] = (0, 200, 255)    # YOLO-CP seeds → yellow
+        active_layers += [("YOLO-CP dilated", (180, 0, 180)), ("YOLO-CP seeds", (0, 200, 255))]
 
     clip_cp_map = getattr(mapper, "clip_cp_obstacle_map", None)
     use_clip_cp = (getattr(mapper, "use_clip_cp_obstacle_map", False) or
@@ -403,9 +406,27 @@ def build_obstacle_layers_panel(mapper) -> np.ndarray:
         cp_mask = clip_cp_map.get_obstacle_mask()
         panel[cp_mask & base_nav] = (180, 0, 180)     # CLIP-CP dilated → purple
         cp_seeds = (clip_cp_map._seed_map > 0)
-        panel[cp_seeds & base_nav] = (255, 200, 0)    # CLIP-CP seeds → yellow
+        panel[cp_seeds & base_nav] = (0, 200, 255)    # CLIP-CP seeds → yellow
+        active_layers += [("CLIP-CP dilated", (180, 0, 180)), ("CLIP-CP seeds", (0, 200, 255))]
 
-    return cv2.resize(orient_xy_map(panel), (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
+    panel = cv2.resize(orient_xy_map(panel), (PANEL_SIZE, PANEL_SIZE), interpolation=cv2.INTER_NEAREST)
+
+    # Draw legend (top-right)
+    legend_items = [("free / unexplored", (0, 0, 0)),
+                    ("depth obstacle", (230, 230, 230))] + active_layers
+    row_h = 18
+    lg_w = 200
+    lg_h = len(legend_items) * row_h + 10
+    x0 = PANEL_SIZE - lg_w - 6
+    y0 = PANEL_SIZE - lg_h - 6
+    cv2.rectangle(panel, (x0, y0), (x0 + lg_w, y0 + lg_h), (40, 40, 40), -1)
+    for i, (lbl, color) in enumerate(legend_items):
+        y = y0 + 8 + i * row_h
+        cv2.rectangle(panel, (x0 + 6, y), (x0 + 22, y + row_h - 6), color, -1)
+        cv2.rectangle(panel, (x0 + 6, y), (x0 + 22, y + row_h - 6), (200, 200, 200), 1)
+        cv2.putText(panel, lbl, (x0 + 28, y + row_h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
+    return panel
 
 
 def build_obstacle_panel(navigable_map: np.ndarray) -> np.ndarray:
@@ -832,8 +853,29 @@ def main() -> None:
             if called_found:
                 result = classify_result(evaluator, episode.scene_id, current_obj, True, poses)
                 break
+
+            # Early stuck detection (matches habitat_evaluator.py):
+            # every 100 steps, if displacement over last 100 steps < 0.1m → abort
+            if step > 0 and step % 100 == 0 and len(poses) >= 100:
+                _recent = np.array(poses[-100:])
+                _disp = float(np.linalg.norm(_recent[-1, :2] - _recent[0, :2]))
+                if _disp < 0.1:
+                    result = Result.FAILURE_STUCK
+                    print(f"Early stuck: displacement={_disp:.4f}m over last 100 steps, aborting at step {step}")
+                    break
         else:
             result = classify_result(evaluator, episode.scene_id, current_obj, False, poses)
+
+        # Post-loop reclassification (matches habitat_evaluator.py):
+        # OOT + barely moved → STUCK
+        poses_arr = np.array(poses)
+        if result == Result.FAILURE_OOT and len(poses_arr) >= 10:
+            if np.linalg.norm(poses_arr[-1] - poses_arr[-10]) < 0.05:
+                result = Result.FAILURE_STUCK
+        # STUCK or OOT + no frontiers → ALL_EXPLORED
+        num_frontiers = len(evaluator.actor.mapper.nav_goals)
+        if result in (Result.FAILURE_STUCK, Result.FAILURE_OOT) and num_frontiers == 0:
+            result = Result.FAILURE_ALL_EXPLORED
     finally:
         if writer is not None:
             writer.release()
