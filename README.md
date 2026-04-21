@@ -10,9 +10,9 @@ Three variants are implemented:
 
 | Variant | Obstacle Detection Logic | Config |
 |---------|------------------------|--------|
-| **Baseline** | None (depth-only) | `eval_conf_mp3d_baseline_mini_dict4.yaml` |
-| **GCLIP Argmax** | `argmax(obs_sim) > max(bg_sim)` | `eval_conf_mp3d_wgate_argmax_full_mini_pathA_add1_dict4.yaml` |
-| **OACP (ours)** | Conformal prediction set with ACI-calibrated margin | `eval_conf_mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4.yaml` |
+| **Baseline** | None (depth-only) | `eval_baseline.yaml` |
+| **GCLIP Argmax** | `argmax(obs_sim) > max(bg_sim)` | `eval_argmax.yaml` |
+| **OACP (ours)** | Conformal prediction set with ACI-calibrated margin | `eval_oacp.yaml` |
 
 ### Key Components
 
@@ -67,6 +67,16 @@ wget https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-e6e.pt -
 wget https://github.com/ChaoningZhang/MobileSAM/raw/refs/heads/master/weights/mobile_sam.pt -O weights/mobile_sam.pt
 ```
 
+### GCLIP Model
+
+The GCLIP obstacle map uses OpenAI's CLIP ViT-B/16 via [open_clip](https://github.com/mlfoundations/open_clip). Weights are downloaded automatically on first run:
+
+```bash
+pip install open_clip_torch
+```
+
+No separate weight file needed — `open_clip.create_model_and_transforms('ViT-B-16', pretrained='openai')` fetches and caches the checkpoint automatically.
+
 ### Data
 
 Place MP3D scene datasets under `datasets/scene_datasets/mp3d/` and ObjectNav episodes under `datasets/objectnav_mp3d_v1/`.
@@ -77,13 +87,13 @@ All experiments use `val_mini` (11 scenes, 33 episodes).
 
 ```bash
 # Baseline (no semantic obstacles)
-xvfb-run -a python -u eval_habitat.py -c config/mon/eval_conf_mp3d_baseline_mini_dict4.yaml
+xvfb-run -a python -u eval_habitat.py -c config/mon/eval_baseline.yaml
 
 # Argmax ablation (GCLIP argmax, no conformal prediction)
-xvfb-run -a python -u eval_habitat.py -c config/mon/eval_conf_mp3d_wgate_argmax_full_mini_pathA_add1_dict4.yaml
+xvfb-run -a python -u eval_habitat.py -c config/mon/eval_argmax.yaml
 
 # OACP (full method)
-xvfb-run -a python -u eval_habitat.py -c config/mon/eval_conf_mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4.yaml
+xvfb-run -a python -u eval_habitat.py -c config/mon/eval_oacp.yaml
 ```
 
 Results are saved to `results/<config_name>/state/state_<ep>.txt` (1=SUCCESS, 7=COLLISION).
@@ -94,7 +104,7 @@ Results are saved to `results/<config_name>/state/state_<ep>.txt` (1=SUCCESS, 7=
 # Single episode video (e.g., ep31 where OACP succeeds and baseline collides)
 xvfb-run -a python -u visualize_single_scene.py \
     --episode-id 31 --no-display --output outputs/ep31.mp4 \
-    -c config/mon/eval_conf_mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4.yaml
+    -c config/mon/eval_oacp.yaml
 ```
 
 ## Results (MP3D val_mini, 33 episodes)
