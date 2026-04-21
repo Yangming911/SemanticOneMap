@@ -1,182 +1,135 @@
-<p align="center">
-  <img src="docs/sys.png" width="900", style="border-radius:10%">
-  <h1 align="center">One Map to Find Them All: Real-time Open-Vocabulary Mapping for Zero-shot Multi-Object Navigation</h1>
-  <h3 align="center">
-    <a href="https://www.kth.se/profile/flbusch?l=en">Finn Lukas Busch</a>,
-    <a href="https://www.kth.se/profile/timonh">Timon Homberger</a>,
-    <a href="https://www.kth.se/profile/jgop">Jesús Ortega-Peimbert</a>,
-    <a href="https://www.kth.se/profile/quantao?l=en">Quantao Yang</a>,
-    <a href="https://www.kth.se/profile/olovand" style="white-space: nowrap;"> Olov Andersson</a>
-  </h3>
-  <p align="center">
-    <a href="https://www.finnbusch.com/OneMap/">Project Website</a> , <a href="https://arxiv.org/pdf/2409.11764">Paper (arXiv)</a>
-  </p>
-</p>
-<p align="center">
-  <a href="https://github.com/KTH-RPL/OneMap/actions/workflows/docker-build.yml">
-    <img src="https://github.com/KTH-RPL/OneMap/actions/workflows/docker-build.yml/badge.svg" alt="Docker Build">
-  </a>
-</p>
+# SemanticOneMap: OACP Semantic Obstacle Avoidance for Object Navigation
 
-This repository contains the code for the paper "One Map to Find Them All: Real-time Open-Vocabulary Mapping for
-Zero-shot Multi-Object Navigation". We provide a [dockerized environment](#setup-docker) to run the code or
-you can [run it locally](#setup-local-without-docker).
+Built on [OneMap](https://github.com/KTH-RPL/OneMap). This fork adds **Online Adaptive Conformal Prediction (OACP)** for semantic obstacle detection and avoidance during zero-shot object navigation.
 
-In summary we open-source:
-- The OneMap mapping and navigation code
-- The evaluation code for single- and multi-object navigation
-- The multi-object navigation dataset and benchmark
-- The multi-object navigation dataset generation code, such that you can generate your own datasets
+## Method Overview
 
-## Abstract
-The capability to efficiently search for objects in complex environments is fundamental for many real-world robot 
-applications. Recent advances in open-vocabulary vision models have resulted in semantically-informed object navigation \
-methods that allow a robot to search for an arbitrary object without prior training. However, these 
-zero-shot methods have so far treated the environment as unknown for each consecutive query.
-In this paper we introduce a new benchmark for zero-shot multi-object navigation, allowing the robot to leverage
-information gathered from previous searches to more efficiently find new objects. To address this problem we build a
-reusable open-vocabulary feature map tailored for real-time object search. We further propose a probabilistic-semantic
-map update that mitigates common sources of errors in semantic feature extraction and leverage this semantic uncertainty
-for informed multi-object exploration. We evaluate our method on a set of object navigation tasks in both simulation
-as well as with a real robot, running in real-time on a Jetson Orin AGX. We demonstrate that it outperforms existing
-state-of-the-art approaches both on single and multi-object navigation tasks.
-## Setup (Docker)
-### 0. Docker 
-You will need to have Docker installed on your system. Follow the [official instructions](https://docs.docker.com/engine/install/ubuntu/) to install.
-You will also need to have the [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-installed and configured as docker runtime on your system.
+The baseline OneMap planner navigates using only geometric (depth) obstacle maps and has no awareness of semantic obstacles — furniture, fixtures, etc. that the robot should not collide with. We add a GCLIP-based semantic obstacle map that identifies and inflates obstacle regions on the navigable map so the planner routes around them.
 
-### 1. Clone the repository
-```
-# https
-git clone https://github.com/KTH-RPL/OneMap.git
-# or ssh
-git clone git@github.com:KTH-RPL/OneMap.git
-cd OneMap/
-```
-### 2. Build the Docker Image
-The docker image build process will build habitat-sim and download model weights. You can choose to let the container
-download the habitat scenes during build, or if you have them already downloaded, you can set `HM3D=LOCAL` and provide
-the absolute `HM3D_PATH` to the `versioned_data` directory on your machine in the `.env` file in the root of the repository. 
+Three variants are implemented:
 
-If you want the container to download the scenes for you, set `HM3D=FULL` in the `.env` file and provide your
-Matterport credentials. You can get access for Matterport for free [here](https://matterport.com/partners/meta).
-You will not need to provide a `HM3D_PATH` then.
-Having configured the `.env` file, you can build the docker image in the root of the repository with:
-```
-docker compose build
-```
-The build will take a while as `habitat-sim` is built from source. You can launch the docker container with:
-```
-bash run_docker.sh
-```
-and open a new terminal in the container with:
-```
-docker exec -it onemap-onemap-1 bash
-```
-## Setup (Local, without Docker)
+| Variant | Obstacle Detection Logic | Config |
+|---------|------------------------|--------|
+| **Baseline** | None (depth-only) | `eval_conf_mp3d_baseline_mini_dict4.yaml` |
+| **GCLIP Argmax** | `argmax(obs_sim) > max(bg_sim)` | `eval_conf_mp3d_wgate_argmax_full_mini_pathA_add1_dict4.yaml` |
+| **OACP (ours)** | Conformal prediction set with ACI-calibrated margin | `eval_conf_mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4.yaml` |
 
-### 1. Clone the repository
+### Key Components
+
+- **`mapping/clip_cp_obstacle_map.py`** — CLIP-based Conformal Prediction obstacle map. Maintains per-cell nonconformity scores, ACI threshold adaptation, and margin-based confidence sets (Path A). Falls back to argmax or threshold modes via config.
+
+- **`eval/semantic_collision.py`** — Ground-truth semantic collision judge. Per-class obstacle dictionary with tuned inflation radii. Includes cross-floor phantom filter (`_MAX_BOTTOM_BELOW_FLOOR`) to prevent false positives from objects on different storeys.
+
+- **`mapping/navigator.py`** — Integrates CLIP-CP obstacle mask into the planner's navigable map. Supports detection gate (activate only after target seen) and step guard (lookahead collision check).
+
+### Obstacle Dictionary (dict4)
+
+Per-class radii tuned via baseline trajectory pass-through analysis:
+
+```python
+_SEMANTIC_SAFETY_RADIUS_CELLS = {
+    "shower":           3,
+    "cabinet":          4,
+    "chest of drawers": 4,
+    "table":            5,
+    "tv":               2,
+}
 ```
-# https
-git clone https://github.com/KTH-RPL/OneMap.git
-# or ssh
-git clone git@github.com:KTH-RPL/OneMap.git
-cd OneMap/
-```
-### 2. Install dependencies
-```
-python3 -m pip install gdown torch torchvision torchaudio meson
-python3 -m pip install -r requirements.txt
-```
-NOTE: Fix to build habitat-sim:
-```
-CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"  python3 -m pip install git+https://github.com/facebookresearch/habitat-sim.git@v0.2.4
-```
-Manually install newer `timm` version:
-```
-python3 -m pip install --upgrade timm>=1.0.7
-```
-YOLOV7:
-```
+
+## Setup
+
+### Prerequisites
+
+- CUDA GPU (tested on RTX 3090)
+- Conda environment with Python 3.8
+- Habitat-sim v0.2.4
+- Matterport3D scene data
+
+### Install
+
+```bash
+conda create -n onemap python=3.8
+conda activate onemap
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
+CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install git+https://github.com/facebookresearch/habitat-sim.git@v0.2.4
+pip install --upgrade timm>=1.0.7
+pip install ./planning_cpp/
 git clone https://github.com/WongKinYiu/yolov7
 ```
-Build planning utilities:
-```
-python3 -m pip install ./planning_cpp/
-```
-### 3. Download the model weights
-```
+
+### Weights
+
+```bash
 mkdir -p weights/
-```
-SED extracted weights:
-```
 gdown 1D_RE4lvA-CiwrP75wsL8Iu1a6NrtrP9T -O weights/clip.pth
-```
-YOLOV7 weights and MobileSAM weights:
-```
 wget https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-e6e.pt -O weights/yolov7-e6e.pt
 wget https://github.com/ChaoningZhang/MobileSAM/raw/refs/heads/master/weights/mobile_sam.pt -O weights/mobile_sam.pt
 ```
-### 4. Download the habitat data
 
+### Data
 
-## Running the code
-### 1. Run the example
-You can run the code on an example, visualized in [rerun.io](https://rerun.io/) with:
-#### Docker
-You will need to have [rerun.io](https://rerun.io/) installed on the host for visualization.
-Ensure the docker is running and you are in the container as described in the [Docker setup](#setup-docker). Then launch
-the rerun viewer **on the host** (not inside the docker) with:
-```
-rerun
-```
-and launch the example in the container with:
-``` 
-python3 habitat_test.py --config config/mon/base_conf_sim.yaml
-```
-#### Local
-Open the rerun viewer and example from the root of the repository with:
-```
-rerun
-python3 habitat_test.py --config config/mon/base_conf_sim.yaml
-```
-### 2. Run the evaluation
-You can reproduce the evaluation results from the paper for single- and multi-object navigation.
-#### Single-object navigation
-```
-python3 eval_habitat.py --config config/mon/eval_conf.yaml
-```
-This will run the evaluation and save the results in the `results/` directory. You can read the results with:
-```
-python3 read_results.py --config config/mon/eval_conf.yaml
-```
-#### Multi-object navigation
-```
-python3 eval_habitat_multi.py --config config/mon/eval_multi_conf.yaml
-```
-This will run the evaluation and save the results in the `results_multi/` directory. You can read the results with:
-```
-python3 read_results_multi.py --config config/mon/eval_multi_conf.yaml
-```
-#### Dataset generation
-While we provide the generated dataset for the evaluation of multi-object navigation, we also release the code to
-generate the datasets with varying parameters. You can generate the dataset with
-```
-python3 eval/dataset_utils/gen_multiobject_dataset.py
-```
-and change the parameters such as number of objects per episode in the corresponding file.
+Place MP3D scene datasets under `datasets/scene_datasets/mp3d/` and ObjectNav episodes under `datasets/objectnav_mp3d_v1/`.
 
-## Citation
-If you use this code in your research, please cite our paper:
+## Running Experiments
+
+All experiments use `val_mini` (11 scenes, 33 episodes).
+
+```bash
+# Baseline (no semantic obstacles)
+xvfb-run -a python -u eval_habitat.py -c config/mon/eval_conf_mp3d_baseline_mini_dict4.yaml
+
+# Argmax ablation (GCLIP argmax, no conformal prediction)
+xvfb-run -a python -u eval_habitat.py -c config/mon/eval_conf_mp3d_wgate_argmax_full_mini_pathA_add1_dict4.yaml
+
+# OACP (full method)
+xvfb-run -a python -u eval_habitat.py -c config/mon/eval_conf_mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4.yaml
 ```
-@misc{busch2024mapallrealtimeopenvocabulary,
-      title={One Map to Find Them All: Real-time Open-Vocabulary Mapping for Zero-shot Multi-Object Navigation}, 
-      author={Finn Lukas Busch and Timon Homberger and Jesús Ortega-Peimbert and Quantao Yang and Olov Andersson},
-      year={2024},
-      eprint={2409.11764},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2409.11764}, 
-}
+
+Results are saved to `results/<config_name>/state/state_<ep>.txt` (1=SUCCESS, 7=COLLISION).
+
+### Visualization
+
+```bash
+# Single episode video (e.g., ep31 where OACP succeeds and baseline collides)
+xvfb-run -a python -u visualize_single_scene.py \
+    --episode-id 31 --no-display --output outputs/ep31.mp4 \
+    -c config/mon/eval_conf_mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4.yaml
 ```
+
+## Results (MP3D val_mini, 33 episodes)
+
+| Method | Collisions | Collision Rate | Success | Success Rate |
+|--------|-----------|---------------|---------|-------------|
+| Baseline | 7 | 21.2% | 2 | 6.1% |
+| GCLIP Argmax | 5 | 15.2% | 4 | 12.1% |
+| **OACP (ours)** | **3** | **9.1%** | **4** | **12.1%** |
+
+Collision reduction: baseline → argmax **−29%**, baseline → OACP **−57%**.
+
+### Per-class breakdown
+
+| Class | Baseline | Argmax | OACP |
+|-------|----------|--------|------|
+| table | 3 | 1 | 0 |
+| shower | 3 | 2 | 2 |
+| cabinet | 1 | 1 | 1 |
+| chest of drawers | 0 | 1 | 0 |
+
+## Project Structure
+
+```
+config/mon/                  # Experiment configs
+eval/
+  semantic_collision.py      # GT collision judge + phantom fix
+  habitat_evaluator.py       # Main evaluation loop
+mapping/
+  clip_cp_obstacle_map.py    # CLIP-CP / OACP obstacle map
+  navigator.py               # Map integration + planner interface
+analysis/                    # Dict tuning & phantom verification scripts
+visualize_single_scene.py    # Episode visualization with obstacle panels
+```
+
+## Acknowledgements
+
+Built on [OneMap](https://github.com/KTH-RPL/OneMap) by Busch et al. (2024).
