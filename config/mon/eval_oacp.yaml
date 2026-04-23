@@ -4,12 +4,12 @@ EvalConf:
   max_dist: 1.0
   is_gibson: False
   dataset_type: "mp3d"
-  object_nav_path: "datasets/objectnav_mp3d_v1/val_mini/content/"
+  object_nav_path: "datasets/objectnav_mp3d_v1/val/content/"
   scene_path: "datasets/scene_datasets/"
   log_rerun: False
   use_pointnav: False
   square_im: True
-  results_path: "results/mp3d_wgate_mp3d_v5e_full_mini_pathA_add1_dict4"
+  results_path: "results/mp3d_oacp_full_d6"
   ep_end: 999999
 
 config: [

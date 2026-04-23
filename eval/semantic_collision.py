@@ -38,19 +38,31 @@ _SEMANTIC_LABEL_ALIASES = {
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    # dict4: per-class radii tuned via baseline-trajectory pass-through analysis
-    # (analysis/phase1_aggregate.py). Each radius = smallest cell count that
-    # makes baseline collide on at least one mp3d_mini ep (after the new
-    # below-floor phantom filter), without growing so wide that the planner
-    # would be unable to navigate corridors.
+    # Primary obstacles (radii tuned via baseline-trajectory pass-through analysis)
     "shower":           3,
     "cabinet":          4,
     "chest of drawers": 4,
     "table":            5,
     "tv":               2,
+    # Secondary obstacles (semantically dangerous, small radii)
+    "toilet":           2,
+    "bathtub":          1,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1
+
+# Extended safety radii for open-vocabulary experiments:
+# MP3D categories not in the original dict that an "external expert" can identify.
+_OPEN_VOCAB_EXPERT_SAFETY = {
+    "bed":     3,
+    "chair":   2,
+    "counter": 3,
+    "couch":   3,   # "sofa" normalises to "couch" via alias
+}
+
+
+def get_full_expert_dict() -> Dict[str, int]:
+    return {**_SEMANTIC_SAFETY_RADIUS_CELLS, **_OPEN_VOCAB_EXPERT_SAFETY}
 
 # COCO classes that never appear indoors — excluded from argmax background competitors
 _OUTDOOR_COCO_LABELS = frozenset({
@@ -172,14 +184,17 @@ def _build_label_seed_map(
     cell_size: float,
     is_gibson: bool,
     floor_y: Optional[float] = None,
+    label_dict: Optional[Dict[str, int]] = None,
 ) -> Tuple[np.ndarray, List[str]]:
+    if label_dict is None:
+        label_dict = _SEMANTIC_SAFETY_RADIUS_CELLS
     labels: List[str] = []
     label_to_idx: Dict[str, int] = {}
     seed_map = np.zeros((n_cells, n_cells), dtype=np.uint16)
 
     for raw_label, objects in object_locations.items():
         label = normalize_semantic_label(raw_label)
-        if label not in _SEMANTIC_SAFETY_RADIUS_CELLS:
+        if label not in label_dict:
             continue
         if label not in label_to_idx:
             label_to_idx[label] = len(labels) + 1
@@ -210,10 +225,11 @@ def build_semantic_collision_data(
     max_query_radius_cells: int,
     floor_y: Optional[float] = None,
     oacp_radius_override: Optional[int] = None,
+    label_dict: Optional[Dict[str, int]] = None,
 ) -> SemanticCollisionData:
     cell_size = size / float(n_cells)
     seed_map, labels = _build_label_seed_map(object_locations, n_cells, cell_size, is_gibson,
-                                              floor_y=floor_y)
+                                              floor_y=floor_y, label_dict=label_dict)
 
     collision_map = np.zeros((n_cells, n_cells), dtype=bool)
     label_map = np.zeros((n_cells, n_cells), dtype=np.uint16)

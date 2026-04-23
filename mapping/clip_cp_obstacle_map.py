@@ -134,6 +134,55 @@ class CLIPCPObstacleMap:
         return self._bg_text_features is not None
 
     # ------------------------------------------------------------------
+    def save_initial_label_state(self) -> None:
+        """Snapshot current label config so it can be restored on episode reset (open-vocab)."""
+        self._saved_text_features = self._text_features.clone()
+        self._saved_labels = list(self._labels)
+        self._saved_radii = list(self._radii)
+        self._saved_bg_text_features = (
+            self._bg_text_features.clone() if self._bg_text_features is not None else None
+        )
+        self._saved_bg_labels = list(self._bg_labels)
+
+    def restore_initial_label_state(self) -> None:
+        """Restore label config to the initial (pre-expansion) state."""
+        if not hasattr(self, "_saved_text_features"):
+            return
+        self.set_text_features(
+            self._saved_text_features.clone(),
+            list(self._saved_labels),
+            list(self._saved_radii),
+            bg_text_features=(
+                self._saved_bg_text_features.clone()
+                if self._saved_bg_text_features is not None
+                else None
+            ),
+            bg_labels=list(self._saved_bg_labels) if self._saved_bg_labels else None,
+        )
+
+    def expand_label(
+        self, label: str, radius: int, text_feature: torch.Tensor
+    ) -> None:
+        """Dynamically add a new obstacle label (open-vocabulary discovery)."""
+        if label in self._labels:
+            return
+        self._labels.append(label)
+        self._radii.append(radius)
+        self._kernels.append(self._make_disk(radius))
+        feat = text_feature.to(self._text_features.device, self._text_features.dtype)
+        if feat.dim() == 1:
+            feat = feat.unsqueeze(0)
+        self._text_features = torch.cat([self._text_features, feat], dim=0)
+        if label in self._bg_labels:
+            idx = self._bg_labels.index(label)
+            self._bg_labels.pop(idx)
+            if self._bg_text_features is not None and self._bg_text_features.shape[0] > idx:
+                self._bg_text_features = torch.cat(
+                    [self._bg_text_features[:idx], self._bg_text_features[idx + 1 :]],
+                    dim=0,
+                )
+
+    # ------------------------------------------------------------------
     def reset(self) -> None:
         self._seed_map.fill(0)
         self._seed_score_map.fill(1.0)
@@ -145,6 +194,12 @@ class CLIPCPObstacleMap:
         self.threshold = self._initial_threshold
         self._calib_step = 0
         self._calibration_log = []
+        self._cj_stats = {
+            "n_updates": 0, "seed_cells": 0, "multi_cells": 0,
+            "flipped_cells": 0, "set_counter": Counter(),
+            "calib_total": 0, "calib_argmax_ok": 0,
+            "calib_cp_recovered": 0, "calib_cp_missed": 0,
+        }
 
     def get_calibration_log(self) -> List[dict]:
         """Return a copy of the calibration log and clear it."""
@@ -295,7 +350,7 @@ class CLIPCPObstacleMap:
         feature_map: torch.Tensor,    # [X, Y, F]
     ) -> None:
         """Recompute obstacle seeds for all CLIP-updated cells."""
-        if self._text_features is None:
+        if self._text_features is None or self._text_features.shape[0] == 0:
             return
         if not updated_mask.any():
             return

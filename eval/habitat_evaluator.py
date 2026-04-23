@@ -451,6 +451,10 @@ class HabitatEvaluator:
             if getattr(self.actor.mapper, "use_clip_cp_obstacle_map", False):
                 _cell_size = self.mapping.size / self.mapping.n_points
                 _max_r = int(self.planner.max_detect_distance / _cell_size)
+                _ov_dict = None
+                if getattr(self.actor.mapper, "_open_vocab", False):
+                    from eval.semantic_collision import get_full_expert_dict
+                    _ov_dict = get_full_expert_dict()
                 _gt_oacp = build_semantic_collision_data(
                     self.scene_data[episode.scene_id].object_locations,
                     self.mapping.n_points, self.mapping.size, self.is_gibson,
@@ -458,6 +462,7 @@ class HabitatEvaluator:
                     max_query_radius_cells=_max_r,
                     floor_y=self._episode_floor_y,
                     oacp_radius_override=15,  # 1.5m radius to cover GCLIP-projected surface cells
+                    label_dict=_ov_dict,
                 )
                 self.actor.mapper.set_gt_label_map(_gt_oacp.label_map, _gt_oacp.labels)
             else:

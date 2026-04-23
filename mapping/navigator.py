@@ -196,20 +196,76 @@ class Navigator:
         self._cp_step_guard_lookahead = int(getattr(config.mapping, "clip_cp_step_guard_lookahead", 3))
         self._cp_detection_gate = bool(getattr(config.mapping, "clip_cp_detection_gate", False))
         self._gclip_query_feat: Optional[torch.Tensor] = None  # GCLIP query embedding, set in set_query()
+        self._open_vocab = False
+        self._holdout_dict: dict = {}         # label -> effective radius (cells)
+        self._holdout_raw_dict: dict = {}     # label -> raw radius from expert dict
+        self._holdout_text_feats: Optional[torch.Tensor] = None
+        self._holdout_labels_list: List[str] = []
+        self._discovered_labels: Set[str] = set()
+        self._discovered_novel: Set[str] = set()
         self.clip_cp_obstacle_map: CLIPCPObstacleMap = None
         if self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map:
-            from eval.semantic_collision import _SEMANTIC_SAFETY_RADIUS_CELLS, _NON_OBSTACLE_LABELS, _OUTDOOR_COCO_LABELS
+            from eval.semantic_collision import (
+                _SEMANTIC_SAFETY_RADIUS_CELLS, _NON_OBSTACLE_LABELS, _OUTDOOR_COCO_LABELS,
+                normalize_semantic_label,
+            )
             from vision_models.coco_classes import COCO_CLASSES
-            _cp_labels = list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())
             _radius_scale = float(getattr(config.mapping, "clip_cp_safety_radius_scale", 1.0))
             _radius_add = int(getattr(config.mapping, "clip_cp_safety_radius_add", 0))
-            _cp_radii = [max(1, int(round(_SEMANTIC_SAFETY_RADIUS_CELLS[l] * _radius_scale)) + _radius_add)
-                         for l in _cp_labels]
+
+            self._open_vocab = bool(getattr(config.mapping, "clip_cp_open_vocab", False))
+            _holdout_set: Set[str] = set()
+            if self._open_vocab:
+                _holdout_str = str(getattr(config.mapping, "clip_cp_holdout_labels", ""))
+                if _holdout_str:
+                    _expert_labels = [
+                        normalize_semantic_label(s.strip())
+                        for s in _holdout_str.split(",") if s.strip()
+                    ]
+                else:
+                    _expert_labels = ["shower", "cabinet", "chest of drawers", "table", "tv"]
+                for lbl in _expert_labels:
+                    if lbl not in _SEMANTIC_SAFETY_RADIUS_CELLS:
+                        print(f"[OPEN-VOCAB] WARNING: expert label '{lbl}' not in safety dict, skipping")
+                        continue
+                    raw_r = _SEMANTIC_SAFETY_RADIUS_CELLS[lbl]
+                    eff_r = max(1, int(round(raw_r * _radius_scale)) + _radius_add)
+                    self._holdout_dict[lbl] = eff_r
+                    self._holdout_raw_dict[lbl] = raw_r
+
+                # Open-vocab: start with empty obstacle dictionary
+                _cp_labels = []
+                _cp_radii = []
+            else:
+                _cp_labels = list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())
+                _cp_radii = [max(1, int(round(_SEMANTIC_SAFETY_RADIUS_CELLS[l] * _radius_scale)) + _radius_add)
+                             for l in _cp_labels]
+
             # Use GCLIP text features for obstacle CP if dual-model enabled
             _cp_feat_model = self.gclip_model if self.gclip_model is not None else self.model
-            _cp_text_feats = _cp_feat_model.get_text_features(
-                [f"a {l}" for l in _cp_labels]
-            ).to(self.one_map.map_device)
+            if _cp_labels:
+                _cp_text_feats = _cp_feat_model.get_text_features(
+                    [f"a {l}" for l in _cp_labels]
+                ).to(self.one_map.map_device)
+            else:
+                _feat_dim = self.gclip_model.feature_dim if self.gclip_model is not None else self.model.feature_dim
+                _cp_text_feats = torch.zeros(0, _feat_dim).to(self.one_map.map_device)
+
+            # Precompute text features for holdout labels
+            if self._open_vocab and self._holdout_dict:
+                self._holdout_labels_list = list(self._holdout_dict.keys())
+                self._holdout_text_feats = _cp_feat_model.get_text_features(
+                    [f"a {l}" for l in self._holdout_labels_list]
+                ).to(self.one_map.map_device)
+                print(
+                    f"\033[1;36m[OPEN-VOCAB] Initial obstacle dictionary: EMPTY\033[0m",
+                    flush=True,
+                )
+                print(
+                    f"\033[1;36m[OPEN-VOCAB] Expert knowledge (to discover): "
+                    f"{self._holdout_labels_list}\033[0m", flush=True,
+                )
+
             # Argmax mode: pass COCO + NON_OBSTACLE as background competitors
             # Margin-OACP mode: also needs BG features for margin computation
             _cp_use_margin = bool(getattr(config.mapping, "clip_cp_use_margin", False))
@@ -240,6 +296,8 @@ class Navigator:
                 bg_text_features=_bg_text_feats,
                 bg_labels=_bg_labels if (self.use_clip_argmax_obstacle_map or _cp_use_margin) else None,
             )
+            if self._open_vocab:
+                self.clip_cp_obstacle_map.save_initial_label_state()
 
         self.use_yolo_cp_obstacle_map = bool(getattr(config.mapping, "use_yolo_cp_obstacle_map", False))
         self.yolo_cp_obstacle_map: YOLOCPObstacleMap = None
@@ -337,6 +395,10 @@ class Navigator:
             self.yolo_obstacle_map.reset()
         if (self.use_clip_argmax_obstacle_map or self.use_clip_cp_obstacle_map) and self.clip_cp_obstacle_map is not None:
             self.clip_cp_obstacle_map.reset()
+            if self._open_vocab:
+                self.clip_cp_obstacle_map.restore_initial_label_state()
+                self._discovered_labels = set()
+                self._discovered_novel = set()
         if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
             self.yolo_cp_obstacle_map.reset()
         self.navigation_scores = np.zeros_like(self.semantic_navigable_map, dtype=np.float32)
@@ -803,6 +865,36 @@ class Navigator:
                         true_label = self._gt_labels[lbl_idx - 1]
                         if self._oracle_noise_rate > 0 and np.random.rand() < self._oracle_noise_rate:
                             continue  # oracle noise: drop this GT sample
+                        # Open-vocab: discover holdout hazards or novel categories
+                        if self._open_vocab:
+                            if (true_label in self._holdout_dict
+                                    and true_label not in self._discovered_labels):
+                                h_idx = self._holdout_labels_list.index(true_label)
+                                h_feat = self._holdout_text_feats[h_idx]
+                                h_radius = self._holdout_dict[true_label]
+                                self.clip_cp_obstacle_map.expand_label(true_label, h_radius, h_feat)
+                                self._discovered_labels.add(true_label)
+                                raw_r = self._holdout_raw_dict[true_label]
+                                dist_m = raw_r * self.one_map.cell_size
+                                n_known = len(self.clip_cp_obstacle_map._labels)
+                                print(
+                                    f"\n\033[1;33m{'='*72}\n"
+                                    f"  [OPEN-VOCAB DISCOVERY] External experts first find '{true_label}'!\n"
+                                    f"  Expert suggests its semantic safety distance as {dist_m:.2f} meter.\n"
+                                    f"  Safety dictionary expanded: {n_known} categories now known.\n"
+                                    f"{'='*72}\033[0m\n",
+                                    flush=True,
+                                )
+                            elif (true_label not in self.clip_cp_obstacle_map._labels
+                                    and true_label not in self._discovered_novel):
+                                self._discovered_novel.add(true_label)
+                                print(
+                                    f"\n\033[1;32m{'='*72}\n"
+                                    f"  [OPEN-VOCAB DISCOVERY] External experts first find '{true_label}'!\n"
+                                    f"  Expert confirms no semantic safety concern.\n"
+                                    f"{'='*72}\033[0m\n",
+                                    flush=True,
+                                )
                         self.clip_cp_obstacle_map.calibrate_aci(
                             _cp_feats[cx, cy, :], true_label
                         )
