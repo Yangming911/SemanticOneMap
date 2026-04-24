@@ -895,9 +895,10 @@ class Navigator:
                                     f"{'='*72}\033[0m\n",
                                     flush=True,
                                 )
-                        self.clip_cp_obstacle_map.calibrate_aci(
-                            _cp_feats[cx, cy, :], true_label
-                        )
+                        if true_label in _SEMANTIC_SAFETY_RADIUS_CELLS:
+                            self.clip_cp_obstacle_map.calibrate_aci(
+                                _cp_feats[cx, cy, :], true_label
+                            )
             # Legacy OACP calibration via YOLO detections
             if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
                 for label, px, py in self.yolo_obstacle_map.latest_projected:

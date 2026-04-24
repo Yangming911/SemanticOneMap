@@ -38,31 +38,14 @@ _SEMANTIC_LABEL_ALIASES = {
 }
 
 _SEMANTIC_SAFETY_RADIUS_CELLS = {
-    # Primary obstacles (radii tuned via baseline-trajectory pass-through analysis)
     "shower":           3,
     "cabinet":          4,
     "chest of drawers": 4,
     "table":            5,
     "tv":               2,
-    # Secondary obstacles (semantically dangerous, small radii)
-    "toilet":           2,
-    "bathtub":          1,
 }
 
 _DEFAULT_SAFETY_RADIUS_CELLS = 1
-
-# Extended safety radii for open-vocabulary experiments:
-# MP3D categories not in the original dict that an "external expert" can identify.
-_OPEN_VOCAB_EXPERT_SAFETY = {
-    "bed":     3,
-    "chair":   2,
-    "counter": 3,
-    "couch":   3,   # "sofa" normalises to "couch" via alias
-}
-
-
-def get_full_expert_dict() -> Dict[str, int]:
-    return {**_SEMANTIC_SAFETY_RADIUS_CELLS, **_OPEN_VOCAB_EXPERT_SAFETY}
 
 # COCO classes that never appear indoors — excluded from argmax background competitors
 _OUTDOOR_COCO_LABELS = frozenset({
