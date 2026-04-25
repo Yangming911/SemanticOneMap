@@ -639,13 +639,13 @@ class HabitatEvaluator:
             with open(f"{self.results_path}/state/state_{episode.episode_id}.txt", 'w') as f:
                 f.write(str(results[n_ep].value))
 
-            # GCLIP argmax: collect per-episode feature alignment stats
+            # GCLIP argmax: per-episode alignment stats (print immediately, don't accumulate)
             _clip_cp = getattr(self.actor.mapper, "clip_cp_obstacle_map", None)
             if _clip_cp is not None and getattr(self.actor.mapper, "use_clip_argmax_obstacle_map", False):
                 try:
                     import torch, torch.nn.functional as _F
                     _feat_map = getattr(self.actor.mapper.one_map, "feature_map_gclip", None)
-                    _text_feats = _clip_cp._text_features  # [N_obs, F]
+                    _text_feats = _clip_cp._text_features
                     _obs_labels = _clip_cp._labels
                     _seed_map = _clip_cp._seed_map
                     _gt_lm = gt_cd.label_map
@@ -660,7 +660,9 @@ class HabitatEvaluator:
                         _nav_np = self.actor.mapper.one_map.navigable_map.astype(bool).reshape(-1)
                         _conf_np = (_norms.numpy() > 1e-6)
                         _free_mask = _nav_np & _conf_np & (_seed_map.reshape(-1) == 0)
-                        _rows = []
+                        _n_obs = int(_obs_mask.sum())
+                        _n_free = int(_free_mask.sum())
+                        _gt_hit, _gt_wrong, _gt_miss = 0, 0, 0
                         for _mask, _cell_type in [(_obs_mask, "argmax_obstacle"), (_free_mask, "free")]:
                             _idxs = np.where(_mask)[0]
                             if len(_idxs) == 0:
@@ -669,54 +671,36 @@ class HabitatEvaluator:
                             _sample = _rng.choice(_idxs, size=min(20, len(_idxs)), replace=False)
                             for _idx in _sample:
                                 _px, _py = int(_idx // _nc), int(_idx % _nc)
-                                _fv = _F.normalize(_flat_t[_idx:_idx+1], dim=1)
-                                _sims = (_fv @ _text_feats.cpu().float().T).squeeze(0).numpy()
                                 _pred_j = int(_seed_map.reshape(-1)[_idx]) - 1 if _seed_map.reshape(-1)[_idx] > 0 else -1
                                 _pred_lbl = _obs_labels[_pred_j] if _pred_j >= 0 else "bg"
                                 _gt_idx = int(_gt_lm[_px, _py])
                                 _gt_lbl = _gt_labels[_gt_idx - 1] if 0 < _gt_idx <= len(_gt_labels) else "bg"
-                                _sim_to_pred = float(_sims[_pred_j]) if _pred_j >= 0 else float(_sims.max())
-                                _gt_j = _obs_labels.index(_gt_lbl) if _gt_lbl in _obs_labels else -1
-                                _sim_to_gt = float(_sims[_gt_j]) if _gt_j >= 0 else float("nan")
-                                _rows.append({
-                                    "episode_id": episode.episode_id,
-                                    "cell_type": _cell_type,
-                                    "px": _px, "py": _py,
-                                    "pred_label": _pred_lbl,
-                                    "gt_label": _gt_lbl,
-                                    "sim_to_pred": _sim_to_pred,
-                                    "sim_to_gt": _sim_to_gt,
-                                    "sim_gap": _sim_to_pred - _sim_to_gt if not np.isnan(_sim_to_gt) else float("nan"),
-                                })
-                        if not hasattr(self, "_gclip_align_rows"):
-                            self._gclip_align_rows = []
-                        self._gclip_align_rows.extend(_rows)
+                                if _gt_lbl != "bg":
+                                    if _cell_type == "free":
+                                        _gt_miss += 1
+                                    elif _pred_lbl == _gt_lbl:
+                                        _gt_hit += 1
+                                    else:
+                                        _gt_wrong += 1
+                        _gt_total = _gt_hit + _gt_wrong + _gt_miss
+                        print(
+                            f"[ALIGN] ep={episode.episode_id} obs_cells={_n_obs} free_cells={_n_free} "
+                            f"gt_obs={_gt_total} hit={_gt_hit} wrong={_gt_wrong} miss={_gt_miss}",
+                            flush=True,
+                        )
                 except Exception as _e:
-                    print(f"Warning: GCLIP alignment collection failed ep={episode.episode_id}: {_e}")
+                    print(f"Warning: GCLIP alignment failed ep={episode.episode_id}: {_e}")
 
-            # OACP calibration log: collect per-episode tau/err trajectory
+            # OACP calibration log: print per-episode summary (don't accumulate)
             if (_clip_cp is not None
                     and getattr(self.actor.mapper, "use_clip_cp_obstacle_map", False)
                     and getattr(_clip_cp, "use_oacp", False)):
                 try:
                     _calib_log = _clip_cp.get_calibration_log()
-                    if not hasattr(self, "_oacp_calib_rows"):
-                        self._oacp_calib_rows = []
-                    for _entry in _calib_log:
-                        self._oacp_calib_rows.append({
-                            "episode_id": episode.episode_id,
-                            "step": _entry["step"],
-                            "tau": _entry["tau"],
-                            "tau_after": _entry.get("tau_after", _entry["tau"]),
-                            "err": _entry["err"],
-                            "alpha": _entry["alpha"],
-                            "s": _entry["s"],
-                        })
-                    # Per-episode summary
                     _n_calls = len(_calib_log)
                     _coverage = (sum(1 for e in _calib_log if e["err"] == 0) / _n_calls) if _n_calls > 0 else float("nan")
                     _final_tau = _calib_log[-1]["tau"] if _calib_log else float("nan")
-                    print(f"OACP ep={episode.episode_id}: n_calib={_n_calls}, coverage={_coverage:.3f}, final_tau={_final_tau:.4f}")
+                    print(f"OACP ep={episode.episode_id}: n_calib={_n_calls}, coverage={_coverage:.3f}, final_tau={_final_tau:.4f}", flush=True)
                 except Exception as _oe:
                     print(f"Warning: OACP log collection failed ep={episode.episode_id}: {_oe}")
 

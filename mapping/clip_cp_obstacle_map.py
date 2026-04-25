@@ -95,8 +95,14 @@ class CLIPCPObstacleMap:
             # Calibration-time recovery stats (available only at GT-reveal events)
             "calib_total": 0,
             "calib_argmax_ok": 0,       # argmax == GT
-            "calib_cp_recovered": 0,    # argmax != GT but GT ∈ C_j (Path A's selling point)
+            "calib_cp_recovered": 0,    # argmax != GT but GT ∈ C_j
             "calib_cp_missed": 0,       # argmax != GT and GT ∉ C_j
+            # Detection-aware stats (GT obstacle cell → what happened on the map?)
+            "det_total": 0,             # observed GT obstacle cells
+            "det_miss": 0,              # seed_map==0: GCLIP did not detect obstacle
+            "det_hit": 0,               # seed_map label == GT label
+            "det_wrong_cp_ok": 0,       # wrong label but GT ∈ C_j (CP recovered)
+            "det_wrong_cp_miss": 0,     # wrong label and GT ∉ C_j
         }
         self._cj_print_every = 50   # print summary every N update() calls
 
@@ -203,6 +209,8 @@ class CLIPCPObstacleMap:
             "flipped_cells": 0, "set_counter": Counter(),
             "calib_total": 0, "calib_argmax_ok": 0,
             "calib_cp_recovered": 0, "calib_cp_missed": 0,
+            "det_total": 0, "det_miss": 0, "det_hit": 0,
+            "det_wrong_cp_ok": 0, "det_wrong_cp_miss": 0,
         }
 
     def get_calibration_log(self) -> List[dict]:
@@ -247,6 +255,7 @@ class CLIPCPObstacleMap:
         self,
         clip_feat: torch.Tensor,
         true_label: str,
+        cell_xy: tuple = None,
     ) -> None:
         """ACI update using GT label (real-time, no distance binning).
 
@@ -257,6 +266,7 @@ class CLIPCPObstacleMap:
         Args:
             clip_feat: CLIP feature vector at the cell [F].
             true_label: ground-truth semantic label of that cell.
+            cell_xy: (cx, cy) cell coordinates for detection-aware stats.
         """
         if not self.use_oacp or self._text_features is None:
             return
@@ -274,33 +284,18 @@ class CLIPCPObstacleMap:
         all_sims_np = (feat_n @ text_feats.T).squeeze(0).detach().cpu().numpy()  # [N_obs]
         sim = float(all_sims_np[j])
 
-        if self.use_margin_score and self._bg_text_features is not None:
-            # Margin score: s = (max_bg_sim - sim + 1) / 2 ∈ [0, 1]
-            # Obstacle cells: sim > max_bg → s < 0.5 (conformal)
-            # BG cells:       max_bg > sim → s > 0.5 (not conformal)
-            bg_feats = self._bg_text_features.to(clip_feat.device)
-            if bg_feats.dtype != feat_n.dtype:
-                bg_feats = bg_feats.to(feat_n.dtype)
-            max_bg_sim = float((feat_n @ bg_feats.T).squeeze(0).max())
-            s = (max_bg_sim - sim + 1.0) / 2.0
-        else:
-            max_bg_sim = None
-            s = 1.0 - sim  # nonconformity score: low = good match
+        # Nonconformity score: s = 1 - sim (cosine distance)
+        s = 1.0 - sim
 
         # err = 1 if current threshold does NOT cover the true label
         C_t = 1.0 - self.threshold  # nonconformity threshold
         err = float(s > C_t)
         tau_before = self.threshold  # log pre-update tau for correct convergence plots
 
-        # ---- Path A recovery stats: does worst-case C_j rescue argmax misses? ----
-        # Compute Path A membership for GT using pre-update τ (and bg gate if margin mode).
+        # ---- CP recovery stats: does confidence set C_j rescue argmax misses? ----
         argmax_j = int(np.argmax(all_sims_np))
-        if self.use_margin_score and max_bg_sim is not None:
-            vs_all_cal = (max_bg_sim - all_sims_np + 1.0) / 2.0
-            dominates_bg_cal = all_sims_np > max_bg_sim
-            conf_cal = dominates_bg_cal & (vs_all_cal <= (1.0 - tau_before))
-        else:
-            conf_cal = (1.0 - all_sims_np) <= (1.0 - tau_before)
+        # C_j = {l : sim(feat, l) >= tau}
+        conf_cal = all_sims_np >= tau_before
         gt_in_cj = bool(conf_cal[j])
         self._cj_stats["calib_total"] += 1
         if argmax_j == j:
@@ -309,11 +304,29 @@ class CLIPCPObstacleMap:
             self._cj_stats["calib_cp_recovered"] += 1
         else:
             self._cj_stats["calib_cp_missed"] += 1
+
+        # ---- Detection-aware stats: GT obstacle cell → seed_map status ----
+        if cell_xy is not None:
+            cx, cy = cell_xy
+            seed_val = int(self._seed_map[cx, cy])
+            self._cj_stats["det_total"] += 1
+            if seed_val == 0:
+                self._cj_stats["det_miss"] += 1
+            else:
+                pred_label = self._labels[seed_val - 1] if seed_val <= len(self._labels) else "?"
+                if pred_label == true_label:
+                    self._cj_stats["det_hit"] += 1
+                elif gt_in_cj:
+                    self._cj_stats["det_wrong_cp_ok"] += 1
+                else:
+                    self._cj_stats["det_wrong_cp_miss"] += 1
+
         tot = self._cj_stats["calib_total"]
         if tot % 20 == 0:
             ok   = self._cj_stats["calib_argmax_ok"]
             rec  = self._cj_stats["calib_cp_recovered"]
             miss = self._cj_stats["calib_cp_missed"]
+            dt   = self._cj_stats["det_total"]
             print(
                 f"[OACP-CP-CALIB] total={tot} "
                 f"argmax_ok={ok} ({100.0*ok/tot:.1f}%) "
@@ -321,6 +334,19 @@ class CLIPCPObstacleMap:
                 f"cp_missed={miss} ({100.0*miss/tot:.1f}%)",
                 flush=True,
             )
+            if dt > 0:
+                dm = self._cj_stats["det_miss"]
+                dh = self._cj_stats["det_hit"]
+                dw = self._cj_stats["det_wrong_cp_ok"]
+                dx = self._cj_stats["det_wrong_cp_miss"]
+                print(
+                    f"[OACP-DET-STATS] gt_obs={dt} "
+                    f"miss={dm} ({100.0*dm/dt:.1f}%) "
+                    f"hit={dh} ({100.0*dh/dt:.1f}%) "
+                    f"wrong+cp_ok={dw} ({100.0*dw/dt:.1f}%) "
+                    f"wrong+cp_miss={dx} ({100.0*dx/dt:.1f}%)",
+                    flush=True,
+                )
         # ------------------------------------------------------------------
 
         # ACI gradient step
@@ -399,20 +425,29 @@ class CLIPCPObstacleMap:
             vbest_sim = best_sim[valid]
 
             if self.use_margin_score and best_bg_sim is not None:
-                # Worst-case Margin-OACP (Path A): C_j = { l : sim(l)>max_bg ∧ s(l)≤1−τ }
-                # Bg gate makes each obstacle label individually beat background;
-                # conformal check enforces ACI-calibrated margin.  d_wc = max radius over C_j.
+                # Detection-first OACP:
+                #   Step 1 — GCLIP argmax detection gate (obs_sim > bg_sim)
+                #   Step 2 — CP confidence set C_j = {l : sim >= tau} for label uncertainty
+                #   Step 3 — worst-case radius from C_j; fallback to argmax label if C_j empty
                 v_obs_sims   = obs_sims[valid]                                # [M', N_obs]
                 v_max_bg     = best_bg_sim[valid]                             # [M']
-                vs_all       = (v_max_bg[:, None] - v_obs_sims + 1.0) / 2.0   # [M', N_obs]
-                dominates_bg = v_obs_sims > v_max_bg[:, None]                 # [M', N_obs]
-                conf_mask    = dominates_bg & (vs_all <= (1.0 - self.threshold))
-                radii_arr  = np.asarray(self._radii, dtype=np.int32)          # [N_obs]
-                # Non-conformal labels get radius = -1 so argmax picks only within C_j
+                argmax_sim_j = np.argmax(v_obs_sims, axis=1)                  # [M']
+                argmax_best  = v_obs_sims[np.arange(len(v_obs_sims)), argmax_sim_j]
+                is_det       = argmax_best > v_max_bg                         # [M'] detection gate
+
+                # Confidence set: simple similarity >= tau (only for detected cells)
+                conf_mask    = (v_obs_sims >= self.threshold) & is_det[:, None]
+                radii_arr    = np.asarray(self._radii, dtype=np.int32)        # [N_obs]
                 masked_radii = np.where(conf_mask, radii_arr[None, :], -1)    # [M', N_obs]
-                chosen_j   = np.argmax(masked_radii, axis=1)                  # [M']
-                is_obs     = conf_mask.any(axis=1)                            # [M']
-                chosen_s   = vs_all[np.arange(vs_all.shape[0]), chosen_j]     # [M']
+                chosen_j     = np.argmax(masked_radii, axis=1)                # [M']
+                has_conf     = conf_mask.any(axis=1)                          # [M']
+
+                # Fallback: detected but C_j empty → use argmax label
+                fallback = is_det & ~has_conf
+                chosen_j[fallback] = argmax_sim_j[fallback]
+
+                is_obs   = is_det
+                chosen_s = 1.0 - v_obs_sims[np.arange(len(v_obs_sims)), chosen_j]
 
                 new_seed[vxs[is_obs],  vys[is_obs]]  = chosen_j[is_obs] + 1
                 new_score[vxs[is_obs],  vys[is_obs]]  = chosen_s[is_obs]
@@ -423,12 +458,11 @@ class CLIPCPObstacleMap:
                     np.argmax(bg_sims[valid][~is_obs], axis=1) + 1
                 )
 
-                # ---- Worst-case C_j stats (for theory-vs-impl analysis) ----
+                # ---- Confidence set stats ----
                 cj_sizes = conf_mask.sum(axis=1)                     # [M']
-                seed_mask = cj_sizes >= 1
-                multi_mask = cj_sizes >= 2
-                argmax_sim_j = np.argmax(v_obs_sims, axis=1)         # [M']
-                flipped = seed_mask & (chosen_j != argmax_sim_j)
+                seed_mask = is_det
+                multi_mask = is_det & (cj_sizes >= 2)
+                flipped = is_det & has_conf & (chosen_j != argmax_sim_j)
                 self._cj_stats["seed_cells"]    += int(seed_mask.sum())
                 self._cj_stats["multi_cells"]   += int(multi_mask.sum())
                 self._cj_stats["flipped_cells"] += int(flipped.sum())

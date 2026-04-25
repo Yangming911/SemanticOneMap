@@ -916,7 +916,8 @@ class Navigator:
                                 )
                         if true_label in self._safety_dict:
                             self.clip_cp_obstacle_map.calibrate_aci(
-                                _cp_feats[cx, cy, :], true_label
+                                _cp_feats[cx, cy, :], true_label,
+                                cell_xy=(cx, cy),
                             )
             # Legacy OACP calibration via YOLO detections
             if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
