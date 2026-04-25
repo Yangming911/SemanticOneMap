@@ -36,11 +36,13 @@ class CLIPCPObstacleMap:
         use_margin_score: bool = False,
         max_seeds_per_label: int = 0,   # 0 = unlimited; >0 = keep only top-K seeds per label
         temporal_persistence: int = 0,  # 0 = disabled; N>0 = cell must be seed for N consecutive frames
+        argmax_confidence: float = 0.0,  # minimum obs similarity for argmax mode (0 = disabled)
     ) -> None:
         self.n_cells = n_cells
         self.cell_size = cell_size
         self.threshold = threshold          # τ in similarity space
         self.use_oacp = use_oacp
+        self.argmax_confidence = argmax_confidence
         self.target_coverage = target_coverage
 
         # Margin-based score mode: s = (max_bg_sim - sim(feat, label) + 1) / 2
@@ -124,7 +126,9 @@ class CLIPCPObstacleMap:
 
     @staticmethod
     def _make_disk(radius: int) -> Optional[np.ndarray]:
-        if radius <= 0:
+        if radius < 0:
+            return None
+        if radius == 0:
             return np.ones((1, 1), dtype=np.uint8)
         d = radius * 2 + 1
         return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
@@ -457,7 +461,10 @@ class CLIPCPObstacleMap:
                 # -----------------------------------------------------------
             elif best_bg_sim is not None:
                 # Argmax mode: obstacle wins only if it beats all background labels
+                # AND exceeds minimum confidence (argmax_confidence > 0)
                 is_obs = vbest_sim > best_bg_sim[valid]
+                if self.argmax_confidence > 0:
+                    is_obs = is_obs & (vbest_sim >= self.argmax_confidence)
                 new_seed[vxs[is_obs],  vys[is_obs]]  = vbest_j[is_obs] + 1
                 new_seed[vxs[~is_obs], vys[~is_obs]] = 0
                 new_bg_winner[vxs[is_obs],  vys[is_obs]]  = 0

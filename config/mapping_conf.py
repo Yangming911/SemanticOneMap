@@ -48,8 +48,10 @@ class MappingConf:
     clip_cp_safety_radius_add: Optional[int] = 0
     clip_cp_step_guard: Optional[bool] = False
     clip_cp_step_guard_lookahead: Optional[int] = 3
+    clip_cp_argmax_confidence: Optional[float] = 0.0
     clip_cp_open_vocab: Optional[bool] = False
     clip_cp_holdout_labels: Optional[str] = ""
+    clip_cp_use_mp3d_labels: Optional[bool] = False
     use_yolo_cp_obstacle_map: Optional[bool] = False
     yolo_cp_threshold: Optional[float] = 0.5
     yolo_cp_target_coverage: Optional[float] = 0.9

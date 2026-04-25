@@ -210,6 +210,7 @@ class Navigator:
                 normalize_semantic_label,
             )
             from vision_models.coco_classes import COCO_CLASSES
+            self._safety_dict = _SEMANTIC_SAFETY_RADIUS_CELLS
             _radius_scale = float(getattr(config.mapping, "clip_cp_safety_radius_scale", 1.0))
             _radius_add = int(getattr(config.mapping, "clip_cp_safety_radius_add", 0))
 
@@ -236,6 +237,23 @@ class Navigator:
                 # Open-vocab: start with empty obstacle dictionary
                 _cp_labels = []
                 _cp_radii = []
+            elif bool(getattr(config.mapping, "clip_cp_use_mp3d_labels", False)):
+                from eval.dataset_utils.mp3d_dataset import MP3D_GOAL_CATEGORIES
+                _seen: Set[str] = set()
+                _cp_labels = []
+                for _raw in MP3D_GOAL_CATEGORIES:
+                    _nl = normalize_semantic_label(_raw)
+                    if _nl not in _seen and _nl not in _NON_OBSTACLE_LABELS:
+                        _seen.add(_nl)
+                        _cp_labels.append(_nl)
+                _cp_radii = [
+                    max(1, int(round(_SEMANTIC_SAFETY_RADIUS_CELLS[l] * _radius_scale)) + _radius_add)
+                    if l in _SEMANTIC_SAFETY_RADIUS_CELLS else -1
+                    for l in _cp_labels
+                ]
+                print(f"[MP3D-LABELS] Using {len(_cp_labels)} MP3D categories: {_cp_labels}")
+                print(f"[MP3D-LABELS] Safety-dict labels: "
+                      f"{[l for l in _cp_labels if l in _SEMANTIC_SAFETY_RADIUS_CELLS]}")
             else:
                 _cp_labels = list(_SEMANTIC_SAFETY_RADIUS_CELLS.keys())
                 _cp_radii = [max(1, int(round(_SEMANTIC_SAFETY_RADIUS_CELLS[l] * _radius_scale)) + _radius_add)
@@ -290,6 +308,7 @@ class Navigator:
                 use_margin_score=_cp_use_margin,
                 max_seeds_per_label=int(getattr(config.mapping, "clip_cp_max_seeds_per_label", 0)),
                 temporal_persistence=int(getattr(config.mapping, "clip_cp_temporal_persistence", 0)),
+                argmax_confidence=float(getattr(config.mapping, "clip_cp_argmax_confidence", 0.0)),
             )
             self.clip_cp_obstacle_map.set_text_features(
                 _cp_text_feats, _cp_labels, _cp_radii,
@@ -895,7 +914,7 @@ class Navigator:
                                     f"{'='*72}\033[0m\n",
                                     flush=True,
                                 )
-                        if true_label in _SEMANTIC_SAFETY_RADIUS_CELLS:
+                        if true_label in self._safety_dict:
                             self.clip_cp_obstacle_map.calibrate_aci(
                                 _cp_feats[cx, cy, :], true_label
                             )

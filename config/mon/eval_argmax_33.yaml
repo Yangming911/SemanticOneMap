@@ -9,11 +9,11 @@ EvalConf:
   log_rerun: False
   use_pointnav: False
   square_im: True
-  results_path: "results/mp3d_oacp_openvocab"
+  results_path: "results/mp3d_argmax_mp3d_33"
   ep_end: 999999
 
 config: [
   ./controller_habitat.yaml,
-  ./mapping_gclip_oacp_openvocab.yaml,
+  ./mapping_gclip_argmax.yaml,
   ./planning_conf.yaml
 ]

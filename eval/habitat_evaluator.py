@@ -451,6 +451,12 @@ class HabitatEvaluator:
             if getattr(self.actor.mapper, "use_clip_cp_obstacle_map", False):
                 _cell_size = self.mapping.size / self.mapping.n_points
                 _max_r = int(self.planner.max_detect_distance / _cell_size)
+                _gt_label_dict = None
+                if bool(getattr(self.mapping, "clip_cp_use_mp3d_labels", False)):
+                    from eval.dataset_utils.mp3d_dataset import MP3D_GOAL_CATEGORIES
+                    from eval.semantic_collision import normalize_semantic_label, _SEMANTIC_SAFETY_RADIUS_CELLS
+                    _gt_label_dict = {normalize_semantic_label(l): 0 for l in MP3D_GOAL_CATEGORIES}
+                    _gt_label_dict.update(_SEMANTIC_SAFETY_RADIUS_CELLS)
                 _gt_oacp = build_semantic_collision_data(
                     self.scene_data[episode.scene_id].object_locations,
                     self.mapping.n_points, self.mapping.size, self.is_gibson,
@@ -458,6 +464,7 @@ class HabitatEvaluator:
                     max_query_radius_cells=_max_r,
                     floor_y=self._episode_floor_y,
                     oacp_radius_override=15,  # 1.5m radius to cover GCLIP-projected surface cells
+                    label_dict=_gt_label_dict,
                 )
                 self.actor.mapper.set_gt_label_map(_gt_oacp.label_map, _gt_oacp.labels)
             else:

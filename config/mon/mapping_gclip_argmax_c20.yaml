@@ -1,4 +1,4 @@
-MappingConf: # W-MP3D v5e + Path A worst-case: clip_cp_safety_radius_add reduced 2→1 (heterogeneous base radii preserved)
+MappingConf: # Ablation: GCLIP argmax obstacle map (no conformal prediction)
   n_points: 600
   size: 60
   agent_radius: 0.2
@@ -22,8 +22,9 @@ MappingConf: # W-MP3D v5e + Path A worst-case: clip_cp_safety_radius_add reduced
   use_yolo_obstacle_map: False
   yolo_window_size: 50
   use_clip_cp_obstacle_map: True
-  clip_cp_use_margin: True
-  clip_cp_use_oacp: True
+  use_clip_argmax_obstacle_map: True
+  clip_cp_use_margin: False
+  clip_cp_use_oacp: False
   clip_cp_target_coverage: 0.9
   clip_cp_max_seeds_per_label: 20
   clip_cp_temporal_persistence: 0
@@ -35,6 +36,7 @@ MappingConf: # W-MP3D v5e + Path A worst-case: clip_cp_safety_radius_add reduced
   clip_cp_step_guard: True
   clip_cp_step_guard_lookahead: 3
   clip_cp_use_mp3d_labels: True
+  clip_cp_argmax_confidence: 0.20
   use_yolo_cp_obstacle_map: False
   yolo_cp_threshold: 0.5
   yolo_cp_target_coverage: 0.9
