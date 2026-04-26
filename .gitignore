@@ -10,8 +10,13 @@ __pycache__/
 *.py[cod]
 
 # Generated outputs
-results/
-results*/
+results/*
+!results/mp3d_baseline_full/
+!results/mp3d_argmax_c30_full/
+!results/mp3d_oacp_full/
+results/*/similarities/
+results/*/trajectories/
+results/*/log*.txt
 outputs/
 
 # Logs

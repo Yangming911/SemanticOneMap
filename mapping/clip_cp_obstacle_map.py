@@ -92,12 +92,7 @@ class CLIPCPObstacleMap:
             "multi_cells": 0,       # cumulative cells with |C_j| >= 2
             "flipped_cells": 0,     # cumulative cells where max-radius != argmax-sim
             "set_counter": Counter(),  # tuple(sorted label indices) -> count
-            # Calibration-time recovery stats (available only at GT-reveal events)
-            "calib_total": 0,
-            "calib_argmax_ok": 0,       # argmax == GT
-            "calib_cp_recovered": 0,    # argmax != GT but GT ∈ C_j
-            "calib_cp_missed": 0,       # argmax != GT and GT ∉ C_j
-            # Detection-aware stats (GT obstacle cell → what happened on the map?)
+            # Detection stats (GT obstacle cell → what happened on the map?)
             "det_total": 0,             # observed GT obstacle cells
             "det_miss": 0,              # seed_map==0: GCLIP did not detect obstacle
             "det_hit": 0,               # seed_map label == GT label
@@ -207,8 +202,6 @@ class CLIPCPObstacleMap:
         self._cj_stats = {
             "n_updates": 0, "seed_cells": 0, "multi_cells": 0,
             "flipped_cells": 0, "set_counter": Counter(),
-            "calib_total": 0, "calib_argmax_ok": 0,
-            "calib_cp_recovered": 0, "calib_cp_missed": 0,
             "det_total": 0, "det_miss": 0, "det_hit": 0,
             "det_wrong_cp_ok": 0, "det_wrong_cp_miss": 0,
         }
@@ -292,20 +285,11 @@ class CLIPCPObstacleMap:
         err = float(s > C_t)
         tau_before = self.threshold  # log pre-update tau for correct convergence plots
 
-        # ---- CP recovery stats: does confidence set C_j rescue argmax misses? ----
-        argmax_j = int(np.argmax(all_sims_np))
+        # ---- Detection stats: GT obstacle cell → what happened on the map? ----
         # C_j = {l : sim(feat, l) >= tau}
         conf_cal = all_sims_np >= tau_before
         gt_in_cj = bool(conf_cal[j])
-        self._cj_stats["calib_total"] += 1
-        if argmax_j == j:
-            self._cj_stats["calib_argmax_ok"] += 1
-        elif gt_in_cj:
-            self._cj_stats["calib_cp_recovered"] += 1
-        else:
-            self._cj_stats["calib_cp_missed"] += 1
 
-        # ---- Detection-aware stats: GT obstacle cell → seed_map status ----
         if cell_xy is not None:
             cx, cy = cell_xy
             seed_val = int(self._seed_map[cx, cy])
@@ -320,31 +304,19 @@ class CLIPCPObstacleMap:
                     self._cj_stats["det_wrong_cp_ok"] += 1
                 else:
                     self._cj_stats["det_wrong_cp_miss"] += 1
-
-        tot = self._cj_stats["calib_total"]
-        if tot % 20 == 0:
-            ok   = self._cj_stats["calib_argmax_ok"]
-            rec  = self._cj_stats["calib_cp_recovered"]
-            miss = self._cj_stats["calib_cp_missed"]
-            dt   = self._cj_stats["det_total"]
-            print(
-                f"[OACP-CP-CALIB] total={tot} "
-                f"argmax_ok={ok} ({100.0*ok/tot:.1f}%) "
-                f"cp_recovered={rec} ({100.0*rec/tot:.1f}%) "
-                f"cp_missed={miss} ({100.0*miss/tot:.1f}%)",
-                flush=True,
-            )
-            if dt > 0:
+            dt = self._cj_stats["det_total"]
+            if dt % 20 == 0:
                 dm = self._cj_stats["det_miss"]
                 dh = self._cj_stats["det_hit"]
                 dw = self._cj_stats["det_wrong_cp_ok"]
                 dx = self._cj_stats["det_wrong_cp_miss"]
                 print(
-                    f"[OACP-DET-STATS] gt_obs={dt} "
+                    f"[OACP-DET] gt_obs={dt} "
                     f"miss={dm} ({100.0*dm/dt:.1f}%) "
                     f"hit={dh} ({100.0*dh/dt:.1f}%) "
                     f"wrong+cp_ok={dw} ({100.0*dw/dt:.1f}%) "
-                    f"wrong+cp_miss={dx} ({100.0*dx/dt:.1f}%)",
+                    f"wrong+cp_miss={dx} ({100.0*dx/dt:.1f}%) "
+                    f"tau={tau_before:.4f}",
                     flush=True,
                 )
         # ------------------------------------------------------------------
