@@ -52,7 +52,6 @@
     \textcolor{blue}{\#\theWSQcomment\ \textbf{#1}} % Add the number and color the comment
 }
 \title{\LARGE \bf
-% Open-Vocabulary Semantic Safety: Adaptive Conformal Prediction for VLM-based Robot Navigation
 Open-World Semantic Safety: Adaptive Conformal Prediction for Zero-Shot Robot Navigation
 }
 % \title{\LARGE \bf 
@@ -97,7 +96,8 @@ Open-World Semantic Safety: Adaptive Conformal Prediction for Zero-Shot Robot Na
 \section{INTRODUCTION}
 
 Safe autonomous navigation in semantically rich environments requires maintaining appropriate distances from objects based on their semantic meaning. Recent work has shown that conformal prediction can provide probabilistic safety guarantees for such semantic planning tasks. However, existing approaches build upon closed-set perception models with fixed label spaces and offline calibration, rendering them unable to handle novel semantic concepts that were absent during the calibration phase.
-We propose Open-Vocabulary Adaptive Conformal Prediction (OACP), a framework that provides probabilistic semantic safety guarantees for VLM-based robot navigation in open-world environments. By defining nonconformity scores in the VLM's continuous embedding space, our framework ...
+
+We propose Open-Vocabulary Adaptive Conformal Prediction (OACP), a framework that provides semantic safety guarantees for VLM-based robot navigation with a dynamically expanding vocabulary. The key insight is that pairwise embedding-space nonconformity scores decouple conformal calibration from vocabulary normalization: adding a new label does not alter previously calibrated scores, enabling online dictionary expansion without recalibration. We evaluate OACP in a fully open-vocabulary setting where the robot starts with an \textit{empty} obstacle dictionary and discovers all hazard categories online during deployment. Experiments on 128 Matterport3D episodes show that OACP reduces semantic collisions by $73.7\%$ relative to the baseline while maintaining formal coverage guarantees under delayed expert feedback.
 
 
 
@@ -117,7 +117,7 @@ Most closely related to our work, Sundarsingh et al.\ \cite{sundarsingh2026safep
 \textbf{Uncertainty Quantification for VLMs.}
 Several studies have applied conformal prediction to quantify the uncertainty of vision-language models \cite{kostumov2024uncertaintyawareevaluationvisionlanguagemodels}, revealing that VLM confidence scores are often poorly calibrated---model uncertainty is not aligned with prediction accuracy. However, these analyses are limited to static visual question answering (VQA) benchmarks and do not address how such uncertainty affects downstream decision-making in embodied agents.
 
-Our work bridges these three lines of research. We propose OACP, which provides formal safety guarantees for VLM-based navigation in open-vocabulary environments. By defining nonconformity scores in the VLM’s continuous embedding space rather than over a fixed label set, OACP enables online calibration that remains valid as new semantic concepts are discovered---without requiring map reconstruction or offline re-calibration.
+Our work bridges these three lines of research. We propose OACP, which provides formal safety guarantees for VLM-based navigation in open-world environments. By defining nonconformity scores in the VLM’s continuous embedding space rather than over a fixed label set, OACP enables online calibration that remains valid as new semantic concepts are discovered---without requiring map reconstruction or offline re-calibration.
 
 
 \section{Problem Formulation}
@@ -533,7 +533,7 @@ Theorem \ref{thm:safety} provides a marginal guarantee for a single cell. For th
 \section{EXPERIMENTS}
 \label{sec:experiments}
 
-We evaluate the proposed OACP framework on the Matterport3D (MP3D) dataset \cite{chang2017matterport3d} using the Habitat simulator \cite{savva2019habitat}. All experiments use a common zero-shot multi-object navigation pipeline with GCLIP dense features for the semantic map and ConvNeXt-CLIP for goal navigation.
+We evaluate OACP on the Matterport3D (MP3D) dataset \cite{chang2017matterport3d} using the Habitat simulator \cite{savva2019habitat}. Critically, \textit{all obstacle categories are held out}: the robot begins every episode with an empty obstacle dictionary ($\mathcal{V}_0 = \emptyset$) and must discover all hazard categories online through the expert oracle during navigation. This is a 100\% held-out open-vocabulary evaluation---no label is known at deployment time.
 
 \subsection{Setup}
 
@@ -551,11 +551,11 @@ SR measures task performance; SCR measures safety violations; STUCK rate measure
 We define 5 obstacle categories with heterogeneous safety radii (in grid cells at $0.1$\,m/cell): \texttt{shower}~(3), \texttt{cabinet}~(4), \texttt{chest of drawers}~(4), \texttt{table}~(5), \texttt{tv}~(2). A semantic collision occurs when the robot enters the dilated safety zone of any obstacle. The evaluation uses ground-truth object locations from the simulator as the oracle.
 
 \textbf{Conditions.}
-The robot has no prior knowledge of the environment. All obstacle categories are unknown at deployment time and must be discovered online. We compare three conditions on the same 128 episodes:
+We compare three conditions on the same 128 episodes. In all conditions, the robot has \textbf{no prior knowledge} of the environment---it does not know which obstacle categories exist, where they are, or how dangerous they are. Conditions B and C start with $\mathcal{V}_0 = \emptyset$ and discover obstacle categories entirely online:
 \begin{enumerate}
-    \item[\textbf{A.}] \textbf{Baseline (OneMap):} Standard OneMap \cite{reed2024onemap} navigation with YOLO-based obstacle detection. No VLM-based semantic obstacle map.
-    \item[\textbf{B.}] \textbf{GCLIP Argmax:} GCLIP dense features for obstacle detection. The obstacle dictionary is initialized empty and expanded online via the expert oracle (Assumption~2). A fixed confidence threshold ($\tau = 0.30$) gates detection; no conformal prediction.
-    \item[\textbf{C.}] \textbf{OACP (Ours):} Same empty-dictionary initialization as B. Full OACP pipeline with ACI-calibrated threshold ($\gamma_{\text{safe}} = 0.9$, $\gamma = 0.05$), worst-case radius from conformal prediction sets.
+    \item[\textbf{A.}] \textbf{Baseline (OneMap):} Standard OneMap \cite{reed2024onemap} navigation with YOLO-based obstacle detection. No VLM-based semantic obstacle map; no semantic safety awareness.
+    \item[\textbf{B.}] \textbf{GCLIP Argmax ($\mathcal{V}_0 = \emptyset$):} GCLIP dense features for obstacle detection. The obstacle dictionary starts empty and is expanded online as the expert oracle (Assumption~2) reveals new categories. A fixed confidence threshold ($\tau = 0.30$) gates detection; no conformal prediction. Safety radius assigned by argmax label.
+    \item[\textbf{C.}] \textbf{OACP ($\mathcal{V}_0 = \emptyset$, Ours):} Same empty-dictionary initialization as B. Full OACP pipeline with ACI-calibrated threshold ($\gamma_{\text{safe}} = 0.9$, $\gamma = 0.05$). Worst-case safety radius from conformal prediction sets. The conformal threshold $C_t$ is calibrated on early-discovered labels and transfers to subsequently discovered ones without recalibration.
 \end{enumerate}
 All three use the same VLM backbone (ConvNeXt-CLIP for navigation, GCLIP for obstacle detection) and identical planner parameters.
 
@@ -576,18 +576,16 @@ C. OACP (Ours)       & 10.2\% & \textbf{7.0\%}  & 40.6\% \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:main_results} presents the main results. The key findings are:
+Table~\ref{tab:main_results} presents the main results. Recall that conditions B and C operate with a \textit{fully held-out vocabulary}: the robot starts each episode with $\mathcal{V}_0 = \emptyset$ and discovers all 5 obstacle categories online. Despite this cold start, the results show:
 
-\textbf{OACP achieves the lowest collision rate.}
-OACP reduces the semantic collision rate from $26.6\%$ (Baseline) to $\mathbf{7.0\%}$, a $\mathbf{73.7\%}$ relative reduction. Compared to GCLIP Argmax ($14.8\%$), OACP achieves a further $52.7\%$ reduction. This confirms that the worst-case conformal prediction sets effectively inflate safety margins where label uncertainty is high.
+\textbf{OACP achieves the lowest collision rate under full vocabulary hold-out.}
+OACP reduces the semantic collision rate from $26.6\%$ (Baseline) to $\mathbf{7.0\%}$, a $\mathbf{73.7\%}$ relative reduction. Compared to GCLIP Argmax ($14.8\%$), which uses the same empty-dictionary initialization but no conformal calibration, OACP achieves a further $52.7\%$ reduction. This confirms that the worst-case conformal prediction sets effectively inflate safety margins where label uncertainty is high, and that the embedding-space calibration transfers successfully to labels discovered online.
 
 \textbf{Safety-efficiency tradeoff.}
-The improved safety comes at the cost of increased STUCK rate ($40.6\%$ vs. $20.3\%$ for Baseline), reflecting the conservative nature of worst-case radius assignment. When $|\mathcal{C}_j| > 1$, the robot plans against the largest safety radius in the prediction set, which can over-block narrow passages. As predicted by the theory, this conservatism decreases as calibration improves and the conformal sets shrink.
+The improved safety comes at the cost of increased STUCK rate ($40.6\%$ vs. $20.3\%$ for Baseline), reflecting the conservative nature of worst-case radius assignment. When $|\mathcal{C}_j| > 1$, the robot plans against the largest safety radius in the prediction set, which can over-block narrow passages. This conservatism can be tuned via $\alpha_{\text{target}}$ and the radius margin; a Pareto sweep over these parameters is a natural direction for balancing the safety-efficiency frontier.
 
-\textbf{Argmax provides a strong detection backbone.}
-The GCLIP Argmax condition already halves the collision rate compared to Baseline ($14.8\%$ vs. $26.6\%$), confirming that the VLM embedding space provides a useful detection signal even without conformal calibration. OACP builds on this backbone by adding uncertainty-aware safety margins.
-
-% TODO: Open-vocabulary ablation — pending full-dataset experiment results
+\textbf{VLM embedding space enables effective open-vocabulary detection.}
+The GCLIP Argmax condition already halves the collision rate compared to Baseline ($14.8\%$ vs. $26.6\%$), even though it starts with zero obstacle knowledge. This confirms that the VLM embedding space provides a strong detection signal for dynamically discovered categories. OACP builds on this backbone by adding uncertainty-aware safety margins via conformal prediction.
 
 
 

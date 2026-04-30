@@ -143,6 +143,11 @@ class HabitatEvaluator:
         ep_end = getattr(config, "ep_end", 999999)
         self.episodes = self.episodes[ep_start:ep_end]
         _inc = getattr(config, "include_ids", None)
+        _inc_file = getattr(config, "include_ids_file", None)
+        if _inc_file is not None and os.path.exists(_inc_file):
+            with open(_inc_file) as _f:
+                _file_ids = [int(line.strip()) for line in _f if line.strip()]
+            _inc = _file_ids if _inc is None else list(_inc) + _file_ids
         if _inc is not None and len(_inc) > 0:
             _inc_set = set(int(i) for i in _inc)
             self.exclude_ids = [i for i in range(len(self.episodes)) if i not in _inc_set]

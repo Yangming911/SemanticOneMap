@@ -22,6 +22,7 @@ class EvalConf:
     ep_start: int = 0        # first episode index (inclusive)
     ep_end: int = 999999     # last episode index (exclusive), 999999 = all
     include_ids: Optional[List[int]] = None  # if set, only run these post-slice episode indices
+    include_ids_file: Optional[str] = None  # path to txt file with one episode ID per line
     dataset_type: Optional[str] = None  # "hm3d", "mp3d", "gibson"; None = auto from is_gibson
 
 
