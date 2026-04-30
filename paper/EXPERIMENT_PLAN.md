@@ -24,6 +24,41 @@
   ```
 - 每个 330-ep run 约需 **20h**（单 4090）
 
+**并行方案：** 330 episodes 已拆成 6 个 shard（每份 55 ep），每个 shard 占用 ~7GB 显存，一块 4090 可同时跑 **6 个 shard**。
+
+| GPU 数量 | 并行策略 | 每个 run 耗时 |
+|---|---|---|
+| 1× 4090 | 6 个 shard 并行，一次完成 1 个 run | ~3.5h |
+| 2× 4090 | 每 GPU 6 个 shard，一次完成 2 个 run | ~3.5h |
+
+Shard 数据集：`datasets/objectnav_mp3d_v1/val_ablation_s{0..5}/content/`
+
+**Important:** 所有实验必须在 `tmux` 中运行，防止 SSH 断连：
+```bash
+# 一块 GPU 上并行 6 个 shard（以 run P1 为例）
+for s in 0 1 2 3 4 5; do
+  tmux new -d -s P1_s${s} \
+    "conda activate onemap && \
+     CUDA_VISIBLE_DEVICES=0 PYTORCH_NO_NVML=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+     xvfb-run -a python -u eval_habitat.py -c config/mon/eval_oacp_a70.yaml \
+     --EvalConf.object_nav_path datasets/objectnav_mp3d_v1/val_ablation_s${s}/content/ \
+     --EvalConf.results_path results/mp3d_oacp_a70/s${s} \
+     2>&1 | tee results/mp3d_oacp_a70/s${s}/log.txt"
+done
+
+# 两块 GPU：GPU 0 跑 P1，GPU 1 跑 P2（各 6 shard）
+# 只需改 CUDA_VISIBLE_DEVICES=1 和对应 config/results_path
+
+# 查看所有会话：tmux ls
+# 全部结束后合并结果：
+mkdir -p results/mp3d_oacp_a70/state
+for s in 0 1 2 3 4 5; do
+  cp results/mp3d_oacp_a70/s${s}/state/* results/mp3d_oacp_a70/state/
+done
+```
+
+如果 spock CLI override 不工作，可以为每个 shard 复制一份 yaml 并手动改 `object_nav_path` 和 `results_path`。
+
 ---
 
 ## Code-Level Parameter Reference

@@ -28,6 +28,7 @@ datasets/*
 !datasets/objectnav_mp3d_v1/
 datasets/objectnav_mp3d_v1/*
 !datasets/objectnav_mp3d_v1/val_ablation/
+!datasets/objectnav_mp3d_v1/val_ablation_s[0-9]*/
 weights/
 yolov7/
 *.pt
