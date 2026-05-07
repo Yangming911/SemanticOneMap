@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Generated outputs
+results/
+outputs/
+
+# Logs
+log/
+*.log
+
+# Large local assets (symlinked at runtime)
+datasets/
+weights/
+yolov7/
+*.pt
+
+# Core dumps
+core
+core.*
