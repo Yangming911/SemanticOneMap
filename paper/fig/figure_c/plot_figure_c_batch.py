@@ -21,7 +21,7 @@ import matplotlib.gridspec as gridspec
 DIR = os.path.dirname(os.path.abspath(__file__))
 
 DELAYS = [0, 5, 10, 20, 100]
-COLORS = {0: '#1f77b4', 5: '#ff7f0e', 10: '#2ca02c', 20: '#d62728', 100: '#9467bd'}
+COLORS = {0: '#d62728', 5: '#ff7f0e', 10: '#2ca02c', 20: '#1f77b4', 100: '#9467bd'}
 TAU_INIT = 0.48
 TAU_OFFLINE = 0.257
 WINDOW_LIGHT = 1
