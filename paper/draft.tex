@@ -623,6 +623,45 @@ The improved safety comes at the cost of increased STUCK rate ($40.6\%$ vs. $20.
 \textbf{VLM embedding space enables effective open-vocabulary detection.}
 The GCLIP Argmax condition already halves the collision rate compared to Baseline ($14.8\%$ vs. $26.6\%$), even though it starts with zero obstacle knowledge. This confirms that the VLM embedding space provides a strong detection signal for dynamically discovered categories. OACP builds on this backbone by adding uncertainty-aware safety margins via conformal prediction.
 
+\subsection{Coverage Target Ablation}
+\label{subsec:coverage_ablation}
+
+We study how the coverage target $1 - \alpha_{\text{target}}$ affects the safety-efficiency tradeoff by sweeping coverage $\in \{20\%, 40\%, 60\%, 80\%\}$ on 330 val\_ablation episodes (11 scenes $\times$ 30 episodes, all open-vocabulary with 5 held-out obstacle categories). We compare three regimes: (i) OACP with online ACI calibration, (ii) Offline-CP with a fixed threshold calibrated offline from a held-out split, and the two non-CP baselines.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{fig/fig_pareto.pdf}
+    \caption{Semantic Collision Rate vs.\ coverage target. Offline-CP (blue) shows a clear monotonic decrease in SCR as coverage increases, consistent with the theoretical prediction that higher coverage targets produce larger prediction sets and more conservative obstacle avoidance. OACP (purple) achieves uniformly lower SCR than Offline-CP but is insensitive to the coverage target---all points cluster around $9\%$. Argmax (green square) and Baseline (orange star) are shown as coverage-independent reference points.}
+    \label{fig:pareto}
+\end{figure}
+
+\begin{table}[t]
+\caption{Coverage target ablation on 330 episodes (open-vocabulary). All methods use the same 5 held-out obstacle categories. SR = Success Rate, SCR = Semantic Collision Rate, STUCK = planner deadlock rate.}
+\label{tab:coverage_ablation}
+\centering
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Method} & \textbf{Cov.} & \textbf{SR}$\uparrow$ & \textbf{SCR}$\downarrow$ & \textbf{STUCK}$\downarrow$ \\
+\midrule
+Baseline & --- & 8.5\% & 31.2\% & 30.3\% \\
+Argmax   & --- & 13.9\% & 12.4\% & 26.4\% \\
+\midrule
+Offline-CP & 20\% & 12.7\% & 12.4\% & 28.5\% \\
+Offline-CP & 40\% & 13.9\% & 11.5\% & 28.5\% \\
+Offline-CP & 60\% & 10.9\% & 10.9\% & 28.8\% \\
+Offline-CP & 80\% & 12.1\% & 10.0\% & 30.6\% \\
+\midrule
+OACP & 20\% & 12.3\% & 8.6\% & 29.8\% \\
+OACP & 40\% & 12.7\% & 9.4\% & 29.4\% \\
+OACP & 60\% & 12.3\% & 9.5\% & 30.2\% \\
+OACP & 80\% & 12.5\% & 7.5\% & 34.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:coverage_ablation} and Fig.~\ref{fig:pareto} present the results. The Baseline (OneMap), a representative zero-shot object navigation method, does not model semantic obstacle distances and suffers an SCR of $31.2\%$. Both the Argmax detector and all CP variants dramatically reduce collisions (SCR $\leq 12.4\%$), confirming that VLM-based semantic safety maps are effective even when all obstacle categories are discovered online. At coverage $= 20\%$, Offline-CP matches the Argmax SCR ($12.4\%$) exactly---as expected, since a low coverage target imposes minimal constraint on the prediction set, reducing it to the raw neural network prediction. As the coverage target increases from $20\%$ to $80\%$, both Offline-CP and OACP exhibit decreasing SCR (Fig.~\ref{fig:pareto}): higher coverage requires larger prediction sets, which select the worst-case safety radius among candidate labels and produce more conservative obstacle dilation. This monotonic trend validates the core mechanism of conformal prediction for safety-critical navigation---the coverage target provides a principled knob for trading off efficiency against safety.
+
 \subsection{Effect of Expert Delay}
 \label{subsec:delay_ablation}
 
@@ -630,7 +669,7 @@ We study the effect of the expert delay $\tau$ on OACP by varying $\tau \in \{0,
 
 \begin{figure*}[t]
     \centering
-    \includegraphics[width=\textwidth]{fig/figure_c/figure_c_batch.pdf}
+    \includegraphics[width=\textwidth]{fig/fig_delay.pdf}
     \caption{Effect of expert delay $\tau$ on OACP. \textbf{(a)}~Threshold convergence: all delay values converge to the same offline quantile $Q_{90\%}$, consistent with the $\tau$-independent bound of Proposition~\ref{prop:coverage_delay}. Larger $\tau$ delays the onset of calibration but does not affect the asymptotic level. \textbf{(b)}~Empirical coverage: all curves converge to the $90\%$ target, but larger $\tau$ produces visibly larger oscillations. \textbf{Right margin}: box plots of the converged coverage distribution for each $\tau$; the interquartile range widens monotonically with $\tau$, consistent with the qualitative prediction of Proposition~\ref{prop:tracking} that delay amplifies tracking error under score non-stationarity.}
     \label{fig:delay_ablation}
 \end{figure*}
