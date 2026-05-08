@@ -146,6 +146,7 @@ $\mathbf{v}_j^{(t)} \in \mathbb{R}^{d_{\text{em}}}$ & Aggregated VLM visual embe
 $s(\mathbf{v}, l)$ & Nonconformity score: cosine distance in embedding space (Eq.~\ref{eq:nonconf}) \\
 $Q_t$ & Adaptive nonconformity threshold at time $t$ \\
 $\mathcal{C}_j^{(t)} \subseteq \mathcal{V}_t$ & Conformal prediction set: $\{ l \in \mathcal{V}_t \mid s(\mathbf{v}_j^{(t)}, l) \le Q_t \}$ \\
+$\alpha_{\text{target}}$ & Target miscoverage rate for conformal prediction \\
 $\alpha_t$ & Adaptive risk parameter updated online via ACI \\
 $\gamma$ & Step size for the Adaptive Conformal Inference (ACI) update \\
 $\mathcal{S}$ & Sliding-window calibration buffer of nonconformity scores \\
@@ -200,7 +201,7 @@ The core challenge is that the true label $l_j$ is not directly observable. The 
 We formulate a chance-constrained optimal control problem:
 
 \begin{myprob}
-Given a required confidence level $\gamma \in (0, 1)$, our objective is to compute a control sequence that minimizes the path length while ensuring that the probability of violating the semantic safety constraint remains bounded. The optimization problem is formulated as follows:
+Given a target miscoverage rate $\alpha_{\text{target}} \in (0, 1)$, our objective is to compute a control sequence that minimizes the path length while ensuring that the probability of violating the semantic safety constraint remains bounded. The optimization problem is formulated as follows:
 
 \begin{subequations}
 \label{eq:optimization_problem}
@@ -210,11 +211,11 @@ Given a required confidence level $\gamma \in (0, 1)$, our objective is to compu
     \text{subject to} \quad & x_{k+1} = f(x_k, u_k), \quad \forall k, \\
     & x_0 = x_{\text{init}}, \quad x_H \in \mathcal{X}_{\text{goal}}, \\
     & u_k \in \mathcal{U}, \quad \forall k, \\
-    & \mathbb{P}\left( \bigwedge_{j \in \mathcal{J}} \left( \| x_k - c_j \|_2 \ge D_{\text{safe}}(l_j) \right) \right) \ge \gamma, \quad \forall k. \label{eq:chance_constraint}
+    & \mathbb{P}\left( \bigwedge_{j \in \mathcal{J}} \left( \| x_k - c_j \|_2 \ge D_{\text{safe}}(l_j) \right) \right) \ge 1 - \alpha_{\text{target}}, \quad \forall k. \label{eq:chance_constraint}
 \end{align}
 \end{subequations}
 
-The constraint \eqref{eq:chance_constraint} requires that the joint probability of the robot maintaining the required safety distance from \textit{all} grid cells exceeds $\gamma$ at every time step. The core difficulty is twofold: (i) the agent cannot directly observe the true label $l_j$---it can only infer an estimate $\hat{l}_j$ from visual observations via a Vision-Language Model, whose predictions are noisy and prone to hallucination; and (ii) the label space $\mathcal{V}$ is \textit{open}---the agent has no prior knowledge of which semantic categories it will encounter during deployment. In the following sections, we describe how the agent can adaptively calibrate its own prediction uncertainty online, in such a highly unknown and open-vocabulary environment, to satisfy the chance constraint~\eqref{eq:chance_constraint} in a long-run probabilistic sense.
+The constraint \eqref{eq:chance_constraint} requires that the joint probability of the robot maintaining the required safety distance from \textit{all} grid cells exceeds $1 - \alpha_{\text{target}}$ at every time step. The core difficulty is twofold: (i) the agent cannot directly observe the true label $l_j$---it can only infer an estimate $\hat{l}_j$ from visual observations via a Vision-Language Model, whose predictions are noisy and prone to hallucination; and (ii) the label space $\mathcal{V}$ is \textit{open}---the agent has no prior knowledge of which semantic categories it will encounter during deployment. In the following sections, we describe how the agent can adaptively calibrate its own prediction uncertainty online, in such a highly unknown and open-vocabulary environment, to satisfy the chance constraint~\eqref{eq:chance_constraint} in a long-run probabilistic sense.
 
 \section{METHODOLOGY}
 \label{sec:methodology}
@@ -262,7 +263,7 @@ When $|\mathcal{C}_j^{(t)}| = 1$, the conformal set has collapsed to the single 
 \subsubsection{Online Adaptive Conformal Inference (ACI)}
 \label{subsubsec:aci}
 
-Observe that if $Q_t$ is calibrated such that the true label $l_j$ is contained in the prediction set $\mathcal{C}_j^{(t)}$ with probability at least $\gamma$, i.e., $\mathbb{P}(l_j \in \mathcal{C}_j^{(t)}) \ge \gamma$, then planning against the worst-case distance $d_{\text{wc}}^{(j,t)}$ from Eq.~\eqref{eq:wc_dist} directly satisfies the chance constraint~\eqref{eq:chance_constraint}. The question thus reduces to: \textit{how to calibrate $Q_t$ online?} This requires access to ground-truth labels, which we formalize via the following assumption:
+Observe that if $Q_t$ is calibrated such that the true label $l_j$ is contained in the prediction set $\mathcal{C}_j^{(t)}$ with probability at least $1 - \alpha_{\text{target}}$, i.e., $\mathbb{P}(l_j \in \mathcal{C}_j^{(t)}) \ge 1 - \alpha_{\text{target}}$, then planning against the worst-case distance $d_{\text{wc}}^{(j,t)}$ from Eq.~\eqref{eq:wc_dist} directly satisfies the chance constraint~\eqref{eq:chance_constraint}. The question thus reduces to: \textit{how to calibrate $Q_t$ online?} This requires access to ground-truth labels, which we formalize via the following assumption:
 
 \textbf{Assumption 2 (Delayed Expert Oracle):} There exists an expert perception model $f_{\text{expert}}$ that, for any grid cell $j$ observed at time $t$, returns the true semantic label $l_j$ after a bounded delay $\tau_j \le \tau$, where $\tau \in \mathbb{N}$ is a known upper bound. That is, at time $t + \tau_j$, the label $l_j$ is revealed with certainty. The real-time planning model $f_{\text{real-time}}$ used for online inference may produce noisy or incorrect predictions, but the expert oracle is assumed to be infallible.
 
@@ -555,7 +556,7 @@ Let $V$ be the violation event $\| x_t - c_j \| < D_{\text{safe}}(l_j)$. Then $V
 
 \begin{remark}[\textbf{Scope of Guarantee}]
 Two caveats apply.
-(i)~Theorem~\ref{thm:safety} provides a marginal guarantee for a single cell. Satisfying the joint chance constraint~\eqref{eq:chance_constraint} over all cells strictly requires a union bound (e.g., $\alpha_{\text{target}} \approx \gamma / M$).
+(i)~Theorem~\ref{thm:safety} provides a marginal guarantee for a single cell. Satisfying the joint chance constraint~\eqref{eq:chance_constraint} over all cells strictly requires a union bound (e.g., replacing $\alpha_{\text{target}}$ with $\alpha_{\text{target}} / M$).
 (ii)~The conformal coverage provided by Propositions~\ref{prop:coverage_delay}--\ref{prop:tracking} is a \emph{long-run average}: $\frac{1}{T}\sum \text{err}_t \to \alpha$. This does not guarantee $\mathbb{P}(\text{err}_t = 1) \le \alpha$ at every individual step. Consequently, the safety bound of Theorem~\ref{thm:safety} holds in the long-run average sense---the fraction of time steps at which the semantic safety distance is violated converges to at most $\alpha_{\text{target}}$.
 In practice, the marginal, long-run-average guarantee is sufficient for robust navigation, as demonstrated in our experiments.
 \end{remark}
@@ -589,8 +590,8 @@ We define 5 obstacle categories with heterogeneous safety radii (in grid cells a
 We compare three conditions on the same 128 episodes. In all conditions, the robot has \textbf{no prior knowledge} of the environment---it does not know which obstacle categories exist, where they are, or how dangerous they are. Conditions B and C start with $\mathcal{V}_0 = \emptyset$ and discover obstacle categories entirely online:
 \begin{enumerate}
     \item[\textbf{A.}] \textbf{Baseline (OneMap):} Standard OneMap \cite{reed2024onemap} navigation with YOLO-based obstacle detection. No VLM-based semantic obstacle map; no semantic safety awareness.
-    \item[\textbf{B.}] \textbf{GCLIP Argmax ($\mathcal{V}_0 = \emptyset$):} GCLIP dense features for obstacle detection. The obstacle dictionary starts empty and is expanded online as the expert oracle (Assumption~2) reveals new categories. A fixed confidence threshold ($\tau = 0.30$) gates detection; no conformal prediction. Safety radius assigned by argmax label.
-    \item[\textbf{C.}] \textbf{OACP ($\mathcal{V}_0 = \emptyset$, Ours):} Same empty-dictionary initialization as B. Full OACP pipeline with ACI-calibrated threshold ($\gamma_{\text{safe}} = 0.9$, $\gamma = 0.05$). Worst-case safety radius from conformal prediction sets. The conformal threshold $Q_t$ is calibrated on early-discovered labels and transfers to subsequently discovered ones without recalibration.
+    \item[\textbf{B.}] \textbf{GCLIP Argmax ($\mathcal{V}_0 = \emptyset$):} GCLIP dense features for obstacle detection. The obstacle dictionary starts empty and is expanded online as the expert oracle (Assumption~2) reveals new categories. A fixed cosine-distance threshold ($q_{\text{fixed}} = 0.30$) gates detection; no conformal prediction. Safety radius assigned by argmax label.
+    \item[\textbf{C.}] \textbf{OACP ($\mathcal{V}_0 = \emptyset$, Ours):} Same empty-dictionary initialization as B. Full OACP pipeline with ACI-calibrated threshold ($\alpha_{\text{target}} = 0.1$, $\gamma = 0.05$). Worst-case safety radius from conformal prediction sets. The conformal threshold $Q_t$ is calibrated on early-discovered labels and transfers to subsequently discovered ones without recalibration.
 \end{enumerate}
 All three use the same VLM backbone (ConvNeXt-CLIP for navigation, GCLIP for obstacle detection) and identical planner parameters.
 
@@ -630,7 +631,7 @@ We study the effect of the expert delay $\tau$ on OACP by varying $\tau \in \{0,
 \begin{figure*}[t]
     \centering
     \includegraphics[width=\textwidth]{fig/figure_c/figure_c_batch.pdf}
-    \caption{Effect of expert delay $\tau$ on OACP. \textbf{(a)}~Threshold convergence: all delay values converge to the same offline quantile $Q_{90\%}$, consistent with the $\tau$-independent bound of Proposition~\ref{prop:coverage_delay}. Larger $\tau$ delays the onset of calibration but does not affect the asymptotic level. \textbf{(b)}~Empirical coverage: all curves converge to the $90\%$ target, but larger $\tau$ produces visibly larger oscillations around the target. \textbf{(c)}~Tracking error (mean absolute deviation from $90\%$ target, after burn-in): increases monotonically with $\tau$, consistent with the $\tau\Delta$ bound of Proposition~\ref{prop:tracking}.}
+    \caption{Effect of expert delay $\tau$ on OACP. \textbf{(a)}~Threshold convergence: all delay values converge to the same offline quantile $Q_{90\%}$, consistent with the $\tau$-independent bound of Proposition~\ref{prop:coverage_delay}. Larger $\tau$ delays the onset of calibration but does not affect the asymptotic level. \textbf{(b)}~Empirical coverage: all curves converge to the $90\%$ target, but larger $\tau$ produces visibly larger oscillations. \textbf{Right margin}: box plots of the converged coverage distribution for each $\tau$; the interquartile range widens monotonically with $\tau$, consistent with the qualitative prediction of Proposition~\ref{prop:tracking} that delay amplifies tracking error under score non-stationarity.}
     \label{fig:delay_ablation}
 \end{figure*}
 
@@ -638,7 +639,7 @@ We study the effect of the expert delay $\tau$ on OACP by varying $\tau \in \{0,
 Fig.~\ref{fig:delay_ablation}(a) shows that $Q_t$ converges to the same offline quantile $Q_{90\%} \approx 0.257$ for all $\tau$ values. Fig.~\ref{fig:delay_ablation}(b) confirms that the empirical coverage reaches $90\%$ in all cases. The episode-level metrics (Appendix Table~\ref{tab:delay_ablation}) further corroborate this: SCR remains between $10.0\%$--$10.9\%$ across all delay values, with no systematic degradation. These observations are consistent with Proposition~\ref{prop:coverage_delay}, which predicts $O(1/T)$ convergence with a bound independent of $\tau$.
 
 \textbf{Tracking oscillations grow with delay (Proposition~\ref{prop:tracking}).}
-While the long-run average converges identically, the \emph{instantaneous} coverage quality degrades with larger $\tau$. Fig.~\ref{fig:delay_ablation}(b) shows that $\tau = 100$ exhibits markedly larger oscillations around the $90\%$ target compared to $\tau = 0$. This is quantified in Fig.~\ref{fig:delay_ablation}(c): the mean absolute tracking error increases monotonically from $0.011$ ($\tau = 0$) to $0.173$ ($\tau = 100$). This matches the $\tau\Delta$ bound of Proposition~\ref{prop:tracking}---larger delay amplifies the effect of score non-stationarity caused by the robot encountering different obstacle categories during exploration.
+While the long-run average converges identically, the \emph{instantaneous} coverage quality degrades with larger $\tau$. Fig.~\ref{fig:delay_ablation}(b) shows that $\tau = 100$ exhibits markedly larger oscillations around the $90\%$ target compared to $\tau = 0$. The marginal box plots in Fig.~\ref{fig:delay_ablation}(b) quantify this: the interquartile range of the converged coverage distribution widens monotonically with $\tau$, from a tight concentration near $0.9$ at $\tau = 0$ to a broad spread at $\tau = 100$. This is consistent with Proposition~\ref{prop:tracking}, which predicts that the tracking error grows with $\tau$ when the score distribution is non-stationary---as is the case here, where the robot encounters different obstacle categories with heterogeneous VLM recognition difficulty during exploration.
 
 
 \section{Conclusion}

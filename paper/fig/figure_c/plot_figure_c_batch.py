@@ -1,9 +1,8 @@
 """Figure C: Delay Ablation — per-sim-step batch ACI.
 
-Three panels:
+Two panels; panel (b) has marginal box plots on right edge:
   (a) Threshold Convergence — Q_t over time (Proposition 2)
-  (b) Empirical Coverage — rolling coverage over time (Proposition 2)
-  (c) Tracking Error vs Delay — MAE |coverage - target| (Proposition 3)
+  (b) Empirical Coverage + right-margin box plots (Proposition 3)
 
 Data: ep24 from shard 3 (val_ablation), per-sim-step batch calibration.
 K=0 uses delay=1 as proxy (batch logging, negligible difference).
@@ -17,6 +16,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,9 +31,16 @@ TARGET = 0.9
 BURN_IN = 300
 TRACK_WINDOW = 50
 
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig = plt.figure(figsize=(15, 5))
+gs = gridspec.GridSpec(1, 3, width_ratios=[5, 4.2, 0.8], wspace=0.35)
+gs_right = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1:],
+                                            width_ratios=[5, 1], wspace=0.02)
 
-mae_values = {}
+ax_a = fig.add_subplot(gs[0])
+ax_b = fig.add_subplot(gs_right[0])
+ax_box = fig.add_subplot(gs_right[1], sharey=ax_b)
+
+cov_distributions = {}
 
 for d in DELAYS:
     csv_path = os.path.join(DIR, f'ep24_batch_delay{d}.csv')
@@ -55,59 +62,66 @@ for d in DELAYS:
     tau_heavy = pd.Series(tau).rolling(WINDOW_HEAVY, min_periods=1).mean().values
     cov_heavy = pd.Series(1.0 - err).rolling(WINDOW_HEAVY, min_periods=1).mean().values
 
-    # Panel (a): threshold
-    axes[0].plot(steps, tau_light, color=COLORS[d], linewidth=0.8, alpha=0.3)
     lw = 1.8 if d in (0, 100) else 1.4
-    axes[0].plot(steps, tau_heavy, color=COLORS[d], linewidth=lw, alpha=0.9, label=f'K={d}')
+
+    # Panel (a): threshold
+    ax_a.plot(steps, tau_light, color=COLORS[d], linewidth=0.8, alpha=0.3)
+    ax_a.plot(steps, tau_heavy, color=COLORS[d], linewidth=lw, alpha=0.9, label=r'$\tau$={}'.format(d))
 
     # Panel (b): coverage
-    axes[1].plot(steps, cov_light, color=COLORS[d], linewidth=0.8, alpha=0.3)
-    axes[1].plot(steps, cov_heavy, color=COLORS[d], linewidth=lw, alpha=0.9, label=f'K={d}')
+    ax_b.plot(steps, cov_light, color=COLORS[d], linewidth=0.8, alpha=0.3)
+    ax_b.plot(steps, cov_heavy, color=COLORS[d], linewidth=lw, alpha=0.9, label=r'$\tau$={}'.format(d))
 
-    # Panel (c) data: tracking error after burn-in
+    # Coverage distribution after convergence (for box plots)
     cov_roll = pd.Series(1.0 - err).rolling(TRACK_WINDOW, min_periods=TRACK_WINDOW).mean().values
     valid = cov_roll[BURN_IN:]
     valid = valid[~np.isnan(valid)]
-    mae_values[d] = np.mean(np.abs(valid - TARGET))
+    cov_distributions[d] = valid
 
-# Panel (a) reference
-axes[0].axhline(y=TAU_OFFLINE, color='black', linestyle='--', linewidth=1,
-                label=r'offline $Q_{90\%}$')
+# Panel (a) styling
+ax_a.axhline(y=TAU_OFFLINE, color='black', linestyle='--', linewidth=1,
+             label=r'offline $Q_{90\%}$')
+ax_a.set_xscale('log')
+ax_a.set_xlabel('Simulation Step (log scale)', fontsize=13)
+ax_a.set_ylabel(r'Threshold $Q_t$', fontsize=13)
+ax_a.set_title(r'(a) Threshold Convergence', fontsize=14)
+ax_a.legend(fontsize=10, frameon=False)
+ax_a.grid(False)
 
-# Panel (b) reference
-axes[1].axhline(y=TARGET, color='black', linestyle='--', linewidth=1,
-                label='target (90%)')
+# Panel (b) styling
+ax_b.axhline(y=TARGET, color='black', linestyle='--', linewidth=1,
+             label='target (90%)')
+ax_b.set_xscale('log')
+ax_b.set_xlabel('Simulation Step (log scale)', fontsize=13)
+ax_b.set_ylabel('Coverage', fontsize=13)
+ax_b.set_title('(b) Empirical Coverage', fontsize=14)
+ax_b.legend(fontsize=10, loc='lower right', frameon=False)
+ax_b.set_ylim(-0.05, 1.05)
+ax_b.grid(False)
 
-for ax in axes[:2]:
-    ax.set_xscale('log')
-    ax.set_xlabel('Simulation Step (log scale)', fontsize=13)
-    ax.grid(True, alpha=0.2, which='both')
+# --- Right margin: vertical box plots showing coverage distribution ---
+box_data = [cov_distributions[d] for d in DELAYS]
+positions = list(range(len(DELAYS)))
 
-axes[0].set_ylabel(r'Threshold $Q_t$', fontsize=13)
-axes[0].set_title(r'(a) Threshold Convergence', fontsize=14)
-axes[0].legend(fontsize=10)
+bp = ax_box.boxplot(box_data, vert=True, positions=positions, widths=0.65,
+                    patch_artist=True, showfliers=False,
+                    medianprops=dict(color='black', linewidth=1.2),
+                    whiskerprops=dict(linewidth=0.8, color='#555555'),
+                    capprops=dict(linewidth=0.8, color='#555555'),
+                    boxprops=dict(linewidth=0.5))
+for patch, d in zip(bp['boxes'], DELAYS):
+    patch.set_facecolor(COLORS[d])
+    patch.set_alpha(0.7)
 
-axes[1].set_ylabel('Coverage', fontsize=13)
-axes[1].set_title('(b) Empirical Coverage', fontsize=14)
-axes[1].legend(fontsize=10)
-axes[1].set_ylim(-0.1, 1.05)
+ax_box.axhline(y=TARGET, color='black', linestyle='--', linewidth=1)
+ax_box.set_xticks(positions)
+ax_box.set_xticklabels([str(d) for d in DELAYS], fontsize=8)
+ax_box.set_xlabel(r'$\tau$', fontsize=10)
+ax_box.tick_params(axis='y', labelleft=False)
+ax_box.grid(False)
 
-# Panel (c): tracking error bar chart
-ks = list(mae_values.keys())
-maes = [mae_values[k] for k in ks]
-bars = axes[2].bar([str(k) for k in ks], maes,
-                   color=[COLORS[k] for k in ks], edgecolor='black', linewidth=0.6)
-axes[2].set_xlabel(r'Expert Delay $\tau$', fontsize=13)
-axes[2].set_ylabel(r'Mean $|$Coverage $- \, 0.9|$', fontsize=13)
-axes[2].set_title('(c) Tracking Error vs. Delay', fontsize=14)
-axes[2].grid(True, alpha=0.2, axis='y')
-for bar, v in zip(bars, maes):
-    axes[2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.003,
-                 f'{v:.3f}', ha='center', va='bottom', fontsize=10)
-
-plt.tight_layout()
 for ext in ['png', 'pdf']:
     out = os.path.join(DIR, f'figure_c_batch.{ext}')
-    plt.savefig(out, dpi=200)
+    plt.savefig(out, dpi=200, bbox_inches='tight')
     print(f'Saved: {out}')
 plt.close()
