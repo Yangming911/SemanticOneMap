@@ -419,6 +419,63 @@ class CLIPCPObstacleMap:
         })
         self._calib_step += 1
 
+    def calibrate_aci_batch(self, entries):
+        """Aggregated ACI update: one α step per sim-step batch of cells.
+
+        Each entry is (clip_feat, true_label, cell_xy, obs_tau).
+        Computes per-cell err using obs_tau, averages into a single
+        fractional err, then does one α gradient step + τ update.
+        """
+        if not self.use_oacp or self._text_features is None:
+            return
+        if self._text_features.shape[0] == 0:
+            return
+
+        errs = []
+        scores = []
+        tau_before = self.threshold
+        text_feats = self._text_features
+
+        for clip_feat, true_label, cell_xy, obs_tau in entries:
+            if true_label not in self._labels:
+                continue
+            if clip_feat.norm() < 1e-6:
+                continue
+            j = self._labels.index(true_label)
+            feat_n = F.normalize(clip_feat.unsqueeze(0), dim=1)
+            tf = text_feats.to(feat_n.device, feat_n.dtype)
+            sim = float((feat_n @ tf.T).squeeze(0)[j])
+            s = 1.0 - sim
+            scores.append(s)
+            C_t = 1.0 - obs_tau
+            errs.append(float(s > C_t))
+
+        if not errs:
+            return
+
+        err_avg = sum(errs) / len(errs)
+
+        self._alpha_t = float(np.clip(
+            self._alpha_t + self._gamma * (self._alpha_target - err_avg),
+            1e-4, 1.0 - 1e-4,
+        ))
+
+        for s in scores:
+            self._scores.append(s)
+        if len(self._scores) >= 5:
+            C_new = float(np.quantile(list(self._scores), 1.0 - self._alpha_t))
+            self.threshold = float(np.clip(1.0 - C_new, 0.0, 1.0))
+
+        self._calibration_log.append({
+            "step": self._calib_step,
+            "tau": tau_before,
+            "tau_after": self.threshold,
+            "err": err_avg,
+            "alpha": self._alpha_t,
+            "s": sum(scores) / len(scores),
+        })
+        self._calib_step += 1
+
     # ------------------------------------------------------------------
     @torch.no_grad()
     def update(

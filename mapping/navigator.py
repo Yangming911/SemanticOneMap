@@ -911,16 +911,13 @@ class Navigator:
                     (1 - _ema_alpha) * self._cells_per_step_ema
                     + _ema_alpha * n_cells_this_step
                 )
-                # Compute adaptive gamma: compensate for K × cells_per_step effective delay
-                _adaptive_gamma = None
-                if self._delay_adaptive_gamma and self._calibration_delay > 0 and self._cells_per_step_ema > 1:
-                    K_eff = self._calibration_delay * self._cells_per_step_ema
-                    _adaptive_gamma = self.clip_cp_obstacle_map._gamma / (1.0 + K_eff)
                 # Drain entries whose oracle-publication step has arrived.
+                # Collect all drainable entries, grouped by their observation sim step.
+                _drain_batches = {}
                 while self._delay_buffer and (
                     self._step_count - self._delay_buffer[0][0]
                 ) >= self._calibration_delay:
-                    _, cx_d, cy_d, lbl_d, feat_d, tau_d = self._delay_buffer.popleft()
+                    obs_step, cx_d, cy_d, lbl_d, feat_d, tau_d = self._delay_buffer.popleft()
                     if self._open_vocab:
                         if (lbl_d in self._holdout_dict
                                 and lbl_d not in self._discovered_labels):
@@ -951,13 +948,21 @@ class Navigator:
                                 flush=True,
                             )
                     if lbl_d in self._safety_dict:
-                        # delay=0: don't pass obs_tau so each cell sees the latest τ (original behavior)
-                        _use_obs_tau = tau_d if self._calibration_delay > 0 else None
-                        self.clip_cp_obstacle_map.calibrate_aci(
-                            feat_d, lbl_d, cell_xy=(cx_d, cy_d),
-                            obs_tau=_use_obs_tau,
-                            gamma_override=_adaptive_gamma,
+                        _drain_batches.setdefault(obs_step, []).append(
+                            (cx_d, cy_d, lbl_d, feat_d, tau_d)
                         )
+                # Per-sim-step aggregated ACI update: one α update per observation step.
+                for obs_step in sorted(_drain_batches):
+                    batch = _drain_batches[obs_step]
+                    if self._calibration_delay > 0:
+                        self.clip_cp_obstacle_map.calibrate_aci_batch(
+                            [(f, l, (cx, cy), t) for cx, cy, l, f, t in batch]
+                        )
+                    else:
+                        for cx_d, cy_d, lbl_d, feat_d, tau_d in batch:
+                            self.clip_cp_obstacle_map.calibrate_aci(
+                                feat_d, lbl_d, cell_xy=(cx_d, cy_d),
+                            )
             # Legacy OACP calibration via YOLO detections
             if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
                 for label, px, py in self.yolo_obstacle_map.latest_projected:
