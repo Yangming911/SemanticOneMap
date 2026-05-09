@@ -37,6 +37,10 @@ class CLIPCPObstacleMap:
         max_seeds_per_label: int = 0,   # 0 = unlimited; >0 = keep only top-K seeds per label
         temporal_persistence: int = 0,  # 0 = disabled; N>0 = cell must be seed for N consecutive frames
         argmax_confidence: float = 0.0,  # minimum obs similarity for argmax mode (0 = disabled)
+        use_softmax_score: bool = False,   # Table B: use -log softmax as nonconformity score
+        softmax_recompute: bool = False,   # Table B C2: recompute buffer on expand_label()
+        softmax_include_bg: bool = True,   # include bg labels in softmax denominator
+        freeze_threshold: bool = False,    # C3: freeze threshold, still log err for coverage
     ) -> None:
         self.n_cells = n_cells
         self.cell_size = cell_size
@@ -78,8 +82,18 @@ class CLIPCPObstacleMap:
         self._bg_winner_map = np.zeros((n_cells, n_cells), dtype=np.uint16)
         self._obstacle_mask = np.zeros((n_cells, n_cells), dtype=bool)
 
+        # Softmax score mode (Table B ablation: closed-set CP)
+        self.use_softmax_score = use_softmax_score
+        self.softmax_recompute = softmax_recompute
+        self.softmax_include_bg = softmax_include_bg
+        self.freeze_threshold = freeze_threshold
+        self._nc_threshold: float = 1.0 - threshold
+
         # OACP calibration buffer (nonconformity scores)
         self._scores: deque = deque(maxlen=window_size)
+        self._feat_label_buffer: Optional[deque] = (
+            deque(maxlen=window_size) if softmax_recompute else None
+        )
 
         # Per-call calibration log for experiment analysis
         self._calib_step: int = 0
@@ -186,6 +200,40 @@ class CLIPCPObstacleMap:
                     [self._bg_text_features[:idx], self._bg_text_features[idx + 1 :]],
                     dim=0,
                 )
+        if self.use_softmax_score and self.softmax_recompute and self._feat_label_buffer:
+            self._recompute_softmax_buffer()
+
+    def _recompute_softmax_buffer(self) -> None:
+        """C2: recompute all buffered softmax scores using current V_t."""
+        new_scores: deque = deque(maxlen=self._scores.maxlen)
+        text_feats = self._text_features
+        for feat, label in self._feat_label_buffer:
+            if label not in self._labels:
+                continue
+            j = self._labels.index(label)
+            feat_n = F.normalize(feat.unsqueeze(0), dim=1)
+            tf = text_feats.to(feat.device, feat_n.dtype)
+            obs_sims = (feat_n @ tf.T).squeeze(0).detach().cpu().numpy()
+            if self.softmax_include_bg and self._bg_text_features is not None and self._bg_text_features.shape[0] > 0:
+                bg_tf = self._bg_text_features.to(feat.device, feat_n.dtype)
+                bg_sims = (feat_n @ bg_tf.T).squeeze(0).detach().cpu().numpy()
+                full_sims = np.concatenate([obs_sims, bg_sims])
+            else:
+                full_sims = obs_sims
+            max_s = np.max(full_sims)
+            logsumexp_val = max_s + np.log(np.sum(np.exp(full_sims - max_s)))
+            s = logsumexp_val - float(obs_sims[j])
+            new_scores.append(s)
+        self._scores = new_scores
+        if len(self._scores) >= 5:
+            C_new = float(np.quantile(list(self._scores), 1.0 - self._alpha_t))
+            self._nc_threshold = C_new
+            self.threshold = float(np.clip(1.0 - C_new, 0.0, 1.0))
+        print(
+            f"[SOFTMAX-RECOMP] Recomputed {len(self._scores)} buffered scores "
+            f"with {len(self._labels)} labels, nc_thresh={self._nc_threshold:.4f}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -195,8 +243,11 @@ class CLIPCPObstacleMap:
         self._bg_winner_map.fill(0)
         self._prev_seed_map.fill(0)
         self._scores.clear()
+        if self._feat_label_buffer is not None:
+            self._feat_label_buffer.clear()
         self._alpha_t = self._initial_alpha    # restore configured initial value
         self.threshold = self._initial_threshold
+        self._nc_threshold = 1.0 - self._initial_threshold
         self._calib_step = 0
         self._calibration_log = []
         self._cj_stats = {
@@ -249,6 +300,8 @@ class CLIPCPObstacleMap:
         clip_feat: torch.Tensor,
         true_label: str,
         cell_xy: tuple = None,
+        obs_tau: float = None,
+        gamma_override: float = None,
     ) -> None:
         """ACI update using GT label (real-time, no distance binning).
 
@@ -277,13 +330,29 @@ class CLIPCPObstacleMap:
         all_sims_np = (feat_n @ text_feats.T).squeeze(0).detach().cpu().numpy()  # [N_obs]
         sim = float(all_sims_np[j])
 
-        # Nonconformity score: s = 1 - sim (cosine distance)
-        s = 1.0 - sim
+        if self.use_softmax_score:
+            if self.softmax_include_bg and self._bg_text_features is not None and self._bg_text_features.shape[0] > 0:
+                bg_tf = self._bg_text_features.to(feat_n.device, feat_n.dtype)
+                bg_sims = (feat_n @ bg_tf.T).squeeze(0).detach().cpu().numpy()
+                full_sims = np.concatenate([all_sims_np, bg_sims])
+            else:
+                full_sims = all_sims_np
+            max_s = np.max(full_sims)
+            logsumexp_val = max_s + np.log(np.sum(np.exp(full_sims - max_s)))
+            s = logsumexp_val - sim
+            softmax_nc_obs = logsumexp_val - all_sims_np
+            n_above_tau = int((softmax_nc_obs <= self._nc_threshold).sum())
+            err = float(s > self._nc_threshold)
+            if self._feat_label_buffer is not None:
+                self._feat_label_buffer.append((clip_feat.clone(), true_label))
+        else:
+            n_above_tau = int((all_sims_np >= self.threshold).sum())
+            s = 1.0 - sim
+            tau_for_err = obs_tau if obs_tau is not None else self.threshold
+            C_t = 1.0 - tau_for_err
+            err = float(s > C_t)
 
-        # err = 1 if current threshold does NOT cover the true label
-        C_t = 1.0 - self.threshold  # nonconformity threshold
-        err = float(s > C_t)
-        tau_before = self.threshold  # log pre-update tau for correct convergence plots
+        tau_before = self.threshold
 
         # ---- Detection stats: GT obstacle cell → what happened on the map? ----
         # C_j = {l : sim(feat, l) >= tau}
@@ -321,17 +390,21 @@ class CLIPCPObstacleMap:
                 )
         # ------------------------------------------------------------------
 
-        # ACI gradient step
-        self._alpha_t = float(np.clip(
-            self._alpha_t + self._gamma * (self._alpha_target - err),
-            1e-4, 1.0 - 1e-4,
-        ))
-
-        # Update τ: nonconformity threshold = (1-α_t) quantile of stored scores
-        self._scores.append(s)
-        if len(self._scores) >= 5:
-            C_new = float(np.quantile(list(self._scores), 1.0 - self._alpha_t))
-            self.threshold = float(np.clip(1.0 - C_new, 0.0, 1.0))
+        if not self.freeze_threshold:
+            _g = gamma_override if gamma_override is not None else self._gamma
+            self._alpha_t = float(np.clip(
+                self._alpha_t + _g * (self._alpha_target - err),
+                1e-4, 1.0 - 1e-4,
+            ))
+            self._scores.append(s)
+            if len(self._scores) >= 5:
+                C_new = float(np.quantile(list(self._scores), 1.0 - self._alpha_t))
+                if self.use_softmax_score:
+                    self._nc_threshold = C_new
+                    self.threshold = float(np.clip(1.0 - C_new, 0.0, 1.0))
+                else:
+                    self.threshold = float(np.clip(1.0 - C_new, 0.0, 1.0))
+                    self._nc_threshold = C_new
 
         # Log calibration call: tau_before pairs with err at this step
         self._calibration_log.append({
@@ -341,6 +414,8 @@ class CLIPCPObstacleMap:
             "err": err,
             "alpha": self._alpha_t,
             "s": s,
+            "|C|": n_above_tau,
+            "n_labels": len(self._labels),
         })
         self._calib_step += 1
 
@@ -407,8 +482,17 @@ class CLIPCPObstacleMap:
                 argmax_best  = v_obs_sims[np.arange(len(v_obs_sims)), argmax_sim_j]
                 is_det       = argmax_best > v_max_bg                         # [M'] detection gate
 
-                # Confidence set: simple similarity >= tau (only for detected cells)
-                conf_mask    = (v_obs_sims >= self.threshold) & is_det[:, None]
+                if self.use_softmax_score:
+                    if self.softmax_include_bg and self._bg_text_features is not None and self._bg_text_features.shape[0] > 0:
+                        full_sims = np.concatenate([v_obs_sims, bg_sims[valid]], axis=1)
+                    else:
+                        full_sims = v_obs_sims
+                    max_row = np.max(full_sims, axis=1, keepdims=True)
+                    lse = max_row + np.log(np.sum(np.exp(full_sims - max_row), axis=1, keepdims=True))
+                    softmax_nc = lse - v_obs_sims
+                    conf_mask = (softmax_nc <= self._nc_threshold) & is_det[:, None]
+                else:
+                    conf_mask = (v_obs_sims >= self.threshold) & is_det[:, None]
                 radii_arr    = np.asarray(self._radii, dtype=np.int32)        # [N_obs]
                 masked_radii = np.where(conf_mask, radii_arr[None, :], -1)    # [M', N_obs]
                 chosen_j     = np.argmax(masked_radii, axis=1)                # [M']

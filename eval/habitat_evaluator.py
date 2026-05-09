@@ -696,7 +696,7 @@ class HabitatEvaluator:
                 except Exception as _e:
                     print(f"Warning: GCLIP alignment failed ep={episode.episode_id}: {_e}")
 
-            # OACP calibration log: print per-episode summary (don't accumulate)
+            # OACP calibration log: print per-episode summary and accumulate for CSV
             if (_clip_cp is not None
                     and getattr(self.actor.mapper, "use_clip_cp_obstacle_map", False)
                     and getattr(_clip_cp, "use_oacp", False)):
@@ -706,6 +706,10 @@ class HabitatEvaluator:
                     _coverage = (sum(1 for e in _calib_log if e["err"] == 0) / _n_calls) if _n_calls > 0 else float("nan")
                     _final_tau = _calib_log[-1]["tau"] if _calib_log else float("nan")
                     print(f"OACP ep={episode.episode_id}: n_calib={_n_calls}, coverage={_coverage:.3f}, final_tau={_final_tau:.4f}", flush=True)
+                    if not hasattr(self, "_oacp_calib_rows"):
+                        self._oacp_calib_rows = []
+                    for _e in _calib_log:
+                        self._oacp_calib_rows.append({"episode_id": episode.episode_id, **_e})
                 except Exception as _oe:
                     print(f"Warning: OACP log collection failed ep={episode.episode_id}: {_oe}")
 
@@ -732,7 +736,7 @@ class HabitatEvaluator:
         if hasattr(self, "_oacp_calib_rows") and self._oacp_calib_rows:
             oacp_csv = f"{self.results_path}/oacp_calibration_{_ts}.csv"
             with open(oacp_csv, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["episode_id","step","tau","tau_after","err","alpha","s"])
+                w = csv.DictWriter(f, fieldnames=["episode_id","step","tau","tau_after","err","alpha","s"], extrasaction='ignore')
                 w.writeheader()
                 w.writerows(self._oacp_calib_rows)
             print(f"Saved OACP calibration CSV: {oacp_csv}")

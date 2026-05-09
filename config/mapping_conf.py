@@ -52,6 +52,12 @@ class MappingConf:
     clip_cp_open_vocab: Optional[bool] = False
     clip_cp_holdout_labels: Optional[str] = ""
     clip_cp_use_mp3d_labels: Optional[bool] = False
+    clip_cp_calibration_delay: Optional[int] = 0
+    clip_cp_delay_adaptive_gamma: Optional[bool] = False
+    clip_cp_use_softmax_score: Optional[bool] = False
+    clip_cp_softmax_recompute: Optional[bool] = False
+    clip_cp_softmax_include_bg: Optional[bool] = True
+    clip_cp_freeze_threshold: Optional[bool] = False
     use_yolo_cp_obstacle_map: Optional[bool] = False
     yolo_cp_threshold: Optional[float] = 0.5
     yolo_cp_target_coverage: Optional[float] = 0.9

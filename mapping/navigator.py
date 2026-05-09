@@ -3,6 +3,7 @@ This module contains the Navigator class, which is responsible for the main func
 for navigation and exploration.
 """
 import time
+from collections import deque
 
 from mapping import (OneMap, detect_frontiers, get_frontier_midpoint,
                      cluster_high_similarity_regions, find_local_maxima,
@@ -195,6 +196,13 @@ class Navigator:
         self._cp_step_guard = bool(getattr(config.mapping, "clip_cp_step_guard", False))
         self._cp_step_guard_lookahead = int(getattr(config.mapping, "clip_cp_step_guard_lookahead", 3))
         self._cp_detection_gate = bool(getattr(config.mapping, "clip_cp_detection_gate", False))
+        # ACI calibration delay (Proposition 2): buffer GT samples for k steps before calibrating.
+        # delay=0 preserves the original direct-call behavior.
+        self._calibration_delay = int(getattr(config.mapping, "clip_cp_calibration_delay", 0))
+        self._delay_adaptive_gamma = bool(getattr(config.mapping, "clip_cp_delay_adaptive_gamma", False))
+        self._delay_buffer: deque = deque()
+        self._step_count = 0
+        self._cells_per_step_ema = 0.0  # exponential moving average of cells buffered per step
         self._gclip_query_feat: Optional[torch.Tensor] = None  # GCLIP query embedding, set in set_query()
         self._open_vocab = False
         self._holdout_dict: dict = {}         # label -> effective radius (cells)
@@ -309,6 +317,10 @@ class Navigator:
                 max_seeds_per_label=int(getattr(config.mapping, "clip_cp_max_seeds_per_label", 0)),
                 temporal_persistence=int(getattr(config.mapping, "clip_cp_temporal_persistence", 0)),
                 argmax_confidence=float(getattr(config.mapping, "clip_cp_argmax_confidence", 0.0)),
+                use_softmax_score=bool(getattr(config.mapping, "clip_cp_use_softmax_score", False)),
+                softmax_recompute=bool(getattr(config.mapping, "clip_cp_softmax_recompute", False)),
+                softmax_include_bg=bool(getattr(config.mapping, "clip_cp_softmax_include_bg", True)),
+                freeze_threshold=bool(getattr(config.mapping, "clip_cp_freeze_threshold", False)),
             )
             self.clip_cp_obstacle_map.set_text_features(
                 _cp_text_feats, _cp_labels, _cp_radii,
@@ -418,6 +430,8 @@ class Navigator:
                 self.clip_cp_obstacle_map.restore_initial_label_state()
                 self._discovered_labels = set()
                 self._discovered_novel = set()
+        self._delay_buffer.clear()
+        self._step_count = 0
         if self.use_yolo_cp_obstacle_map and self.yolo_cp_obstacle_map is not None:
             self.yolo_cp_obstacle_map.reset()
         self.navigation_scores = np.zeros_like(self.semantic_navigable_map, dtype=np.float32)
@@ -795,6 +809,7 @@ class Navigator:
         :param odometry: 4x4 transformation matrix from camera to world
         :return: boolean indicating if the episode is over
         """
+        self._step_count += 1
         odometry = odometry.astype(np.float32)
         x = odometry[0, 3]
         y = odometry[1, 3]
@@ -867,15 +882,15 @@ class Navigator:
                 _cp_mask = self.one_map.updated_mask
                 _cp_feats = self.one_map.feature_map
             self.clip_cp_obstacle_map.update(_cp_mask, _cp_feats)
-            # OACP ACI calibration: use GT labels of near-field cells (simulation)
-            if (self.clip_cp_obstacle_map.use_oacp
-                    and self._gt_label_map is not None):
+            # GT oracle: discover labels (open-vocab) and optionally calibrate ACI
+            if self._gt_label_map is not None:
                 delta_cells = max(1, int(3.0 / self.one_map.cell_size))
                 x0 = max(0, px - delta_cells)
                 x1 = min(self.one_map.n_cells, px + delta_cells + 1)
                 y0 = max(0, py - delta_cells)
                 y1 = min(self.one_map.n_cells, py + delta_cells + 1)
                 region = self._gt_label_map[x0:x1, y0:y1]
+                n_cells_this_step = 0
                 if region.any():
                     xs, ys = np.nonzero(region)
                     for dx, dy in zip(xs, ys):
@@ -883,42 +898,66 @@ class Navigator:
                         lbl_idx = int(region[dx, dy])
                         true_label = self._gt_labels[lbl_idx - 1]
                         if self._oracle_noise_rate > 0 and np.random.rand() < self._oracle_noise_rate:
-                            continue  # oracle noise: drop this GT sample
-                        # Open-vocab: discover holdout hazards or novel categories
-                        if self._open_vocab:
-                            if (true_label in self._holdout_dict
-                                    and true_label not in self._discovered_labels):
-                                h_idx = self._holdout_labels_list.index(true_label)
-                                h_feat = self._holdout_text_feats[h_idx]
-                                h_radius = self._holdout_dict[true_label]
-                                self.clip_cp_obstacle_map.expand_label(true_label, h_radius, h_feat)
-                                self._discovered_labels.add(true_label)
-                                raw_r = self._holdout_raw_dict[true_label]
-                                dist_m = raw_r * self.one_map.cell_size
-                                n_known = len(self.clip_cp_obstacle_map._labels)
-                                print(
-                                    f"\n\033[1;33m{'='*72}\n"
-                                    f"  [OPEN-VOCAB DISCOVERY] External experts first find '{true_label}'!\n"
-                                    f"  Expert suggests its semantic safety distance as {dist_m:.2f} meter.\n"
-                                    f"  Safety dictionary expanded: {n_known} categories now known.\n"
-                                    f"{'='*72}\033[0m\n",
-                                    flush=True,
-                                )
-                            elif (true_label not in self.clip_cp_obstacle_map._labels
-                                    and true_label not in self._discovered_novel):
-                                self._discovered_novel.add(true_label)
-                                print(
-                                    f"\n\033[1;32m{'='*72}\n"
-                                    f"  [OPEN-VOCAB DISCOVERY] External experts first find '{true_label}'!\n"
-                                    f"  Expert confirms no semantic safety concern.\n"
-                                    f"{'='*72}\033[0m\n",
-                                    flush=True,
-                                )
-                        if true_label in self._safety_dict:
-                            self.clip_cp_obstacle_map.calibrate_aci(
-                                _cp_feats[cx, cy, :], true_label,
-                                cell_xy=(cx, cy),
+                            continue
+                        self._delay_buffer.append((
+                            self._step_count, int(cx), int(cy), true_label,
+                            _cp_feats[cx, cy, :].clone(),
+                            self.clip_cp_obstacle_map.threshold,
+                        ))
+                        n_cells_this_step += 1
+                # Track cells-per-step EMA for adaptive gamma
+                _ema_alpha = 0.01
+                self._cells_per_step_ema = (
+                    (1 - _ema_alpha) * self._cells_per_step_ema
+                    + _ema_alpha * n_cells_this_step
+                )
+                # Compute adaptive gamma: compensate for K × cells_per_step effective delay
+                _adaptive_gamma = None
+                if self._delay_adaptive_gamma and self._calibration_delay > 0 and self._cells_per_step_ema > 1:
+                    K_eff = self._calibration_delay * self._cells_per_step_ema
+                    _adaptive_gamma = self.clip_cp_obstacle_map._gamma / (1.0 + K_eff)
+                # Drain entries whose oracle-publication step has arrived.
+                while self._delay_buffer and (
+                    self._step_count - self._delay_buffer[0][0]
+                ) >= self._calibration_delay:
+                    _, cx_d, cy_d, lbl_d, feat_d, tau_d = self._delay_buffer.popleft()
+                    if self._open_vocab:
+                        if (lbl_d in self._holdout_dict
+                                and lbl_d not in self._discovered_labels):
+                            h_idx = self._holdout_labels_list.index(lbl_d)
+                            h_feat = self._holdout_text_feats[h_idx]
+                            h_radius = self._holdout_dict[lbl_d]
+                            self.clip_cp_obstacle_map.expand_label(lbl_d, h_radius, h_feat)
+                            self._discovered_labels.add(lbl_d)
+                            raw_r = self._holdout_raw_dict[lbl_d]
+                            dist_m = raw_r * self.one_map.cell_size
+                            n_known = len(self.clip_cp_obstacle_map._labels)
+                            print(
+                                f"\n\033[1;33m{'='*72}\n"
+                                f"  [OPEN-VOCAB DISCOVERY] External experts first find '{lbl_d}'!\n"
+                                f"  Expert suggests its semantic safety distance as {dist_m:.2f} meter.\n"
+                                f"  Safety dictionary expanded: {n_known} categories now known.\n"
+                                f"{'='*72}\033[0m\n",
+                                flush=True,
                             )
+                        elif (lbl_d not in self.clip_cp_obstacle_map._labels
+                                and lbl_d not in self._discovered_novel):
+                            self._discovered_novel.add(lbl_d)
+                            print(
+                                f"\n\033[1;32m{'='*72}\n"
+                                f"  [OPEN-VOCAB DISCOVERY] External experts first find '{lbl_d}'!\n"
+                                f"  Expert confirms no semantic safety concern.\n"
+                                f"{'='*72}\033[0m\n",
+                                flush=True,
+                            )
+                    if lbl_d in self._safety_dict:
+                        # delay=0: don't pass obs_tau so each cell sees the latest τ (original behavior)
+                        _use_obs_tau = tau_d if self._calibration_delay > 0 else None
+                        self.clip_cp_obstacle_map.calibrate_aci(
+                            feat_d, lbl_d, cell_xy=(cx_d, cy_d),
+                            obs_tau=_use_obs_tau,
+                            gamma_override=_adaptive_gamma,
+                        )
             # Legacy OACP calibration via YOLO detections
             if self.use_yolo_obstacle_map and self.yolo_obstacle_map is not None:
                 for label, px, py in self.yolo_obstacle_map.latest_projected:
@@ -1038,14 +1077,15 @@ class Navigator:
                         if feat.norm() > 1e-6:
                             feat_n = F.normalize(feat.unsqueeze(0), dim=1)
                             obs_feats = self.clip_cp_obstacle_map._text_features.to(feat_n.device)
-                            if obs_feats.dtype != feat_n.dtype:
-                                obs_feats = obs_feats.to(feat_n.dtype)
-                            max_obs_sim = float((feat_n @ obs_feats.T).max())
-                            q_feat = self._gclip_query_feat.to(feat_n.device)
-                            if q_feat.dtype != feat_n.dtype:
-                                q_feat = q_feat.to(feat_n.dtype)
-                            if max_obs_sim > float((feat_n @ q_feat.T).squeeze()):
-                                object_valid = False  # obstacle label dominates → reject detection
+                            if obs_feats.numel() > 0:
+                                if obs_feats.dtype != feat_n.dtype:
+                                    obs_feats = obs_feats.to(feat_n.dtype)
+                                max_obs_sim = float((feat_n @ obs_feats.T).max())
+                                q_feat = self._gclip_query_feat.to(feat_n.device)
+                                if q_feat.dtype != feat_n.dtype:
+                                    q_feat = q_feat.to(feat_n.dtype)
+                                if max_obs_sim > float((feat_n @ q_feat.T).squeeze()):
+                                    object_valid = False
                     if object_valid:
                         self.object_detected = True
                         self.compute_best_path(start)
